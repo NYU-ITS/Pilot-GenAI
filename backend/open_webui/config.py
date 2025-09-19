@@ -1205,7 +1205,7 @@ ENABLE_CHANNELS = PersistentConfig(
 ENABLE_EVALUATION_ARENA_MODELS = PersistentConfig(
     "ENABLE_EVALUATION_ARENA_MODELS",
     "evaluation.arena.enable",
-    os.environ.get("ENABLE_EVALUATION_ARENA_MODELS", "True").lower() == "true",
+    os.environ.get("ENABLE_EVALUATION_ARENA_MODELS", "False").lower() == "true",
 )
 EVALUATION_ARENA_MODELS = PersistentConfig(
     "EVALUATION_ARENA_MODELS",
@@ -1236,7 +1236,7 @@ ENABLE_ADMIN_CHAT_ACCESS = (
 ENABLE_COMMUNITY_SHARING = PersistentConfig(
     "ENABLE_COMMUNITY_SHARING",
     "ui.enable_community_sharing",
-    os.environ.get("ENABLE_COMMUNITY_SHARING", "True").lower() == "true",
+    os.environ.get("ENABLE_COMMUNITY_SHARING", "False").lower() == "true",
 )
 
 ENABLE_MESSAGE_RATING = PersistentConfig(
@@ -1466,7 +1466,7 @@ Strictly return in JSON format:
 ENABLE_AUTOCOMPLETE_GENERATION = PersistentConfig(
     "ENABLE_AUTOCOMPLETE_GENERATION",
     "task.autocomplete.enable",
-    os.environ.get("ENABLE_AUTOCOMPLETE_GENERATION", "True").lower() == "true",
+    os.environ.get("ENABLE_AUTOCOMPLETE_GENERATION", "False").lower() == "true",
 )
 
 AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH = PersistentConfig(
@@ -1840,7 +1840,7 @@ ENABLE_RAG_HYBRID_SEARCH = UserScopedConfig("rag.enable_hybrid_search",os.enviro
 
 RAG_FULL_CONTEXT = UserScopedConfig(
     "rag.full_context",
-    os.getenv("RAG_FULL_CONTEXT", "False").lower() == "true")
+    os.getenv("RAG_FULL_CONTEXT", "True").lower() == "true")
 
 RAG_FILE_MAX_COUNT = PersistentConfig(
     "RAG_FILE_MAX_COUNT",
