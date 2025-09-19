@@ -1410,13 +1410,13 @@ Strictly return in JSON format:
 ENABLE_TAGS_GENERATION = PersistentConfig(
     "ENABLE_TAGS_GENERATION",
     "task.tags.enable",
-    os.environ.get("ENABLE_TAGS_GENERATION", "True").lower() == "true",
+    os.environ.get("ENABLE_TAGS_GENERATION", "False").lower() == "true",
 )
 
 ENABLE_TITLE_GENERATION = PersistentConfig(
     "ENABLE_TITLE_GENERATION",
     "task.title.enable",
-    os.environ.get("ENABLE_TITLE_GENERATION", "True").lower() == "true",
+    os.environ.get("ENABLE_TITLE_GENERATION", "False").lower() == "true",
 )
 
 
