@@ -137,3 +137,5 @@ tavily-python==0.3.3
 ipykernel
 nbformat
 matplotlib
+pocketflow
+pymilvus
