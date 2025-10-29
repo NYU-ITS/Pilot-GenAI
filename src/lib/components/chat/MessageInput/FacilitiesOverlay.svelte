@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { getContext, createEventDispatcher } from 'svelte';
-	import { showFacilitiesOverlay, showControls, models, chatId } from '$lib/stores';
+	import { showFacilitiesOverlay, showControls, models, chatId, chats, currentChatPage } from '$lib/stores';
 	import { slide } from 'svelte/transition';
 	import { generateFacilitiesResponse, getFacilitiesSections } from '$lib/apis/facilities';
+	import { updateChatById, getChatList } from '$lib/apis/chats';
 	import { toast } from 'svelte-sonner';
 	
 	const dispatch = createEventDispatcher();
@@ -174,6 +175,29 @@
 					}
 				]
 			});
+
+			// Generate a proper title for the facilities chat
+			try {
+				const token = localStorage.getItem('token');
+				if (token && $chatId) {
+					// Create a meaningful title based on the sponsor and project
+					const projectTitle = formData.projectTitle || 'Facilities Response';
+					const title = `Facilities Response - ${selectedSponsor} - ${projectTitle}`;
+					
+					// Update the chat title
+					await updateChatById(token, $chatId, {
+						title: title
+					});
+					
+					// Update the chat list to reflect the new title
+					currentChatPage.set(1);
+					await chats.set(await getChatList(token, $currentChatPage));
+					
+					console.log('Updated chat title to:', title);
+				}
+			} catch (error) {
+				console.error('Error updating chat title:', error);
+			}
 		} catch (error) {
 			console.error('Error in addMessages:', error);
 			// Fallback: manually add to history if addMessages fails
@@ -401,7 +425,7 @@
 		<div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
 			<div class="flex-1">
 				<h1 class="text-lg font-semibold text-gray-900 dark:text-white">
-					{('Research Facilities Draft Generator')}
+					{('NYU Research Facilities Draft Generator')}
 				</h1>		
 			</div>
 			
@@ -420,14 +444,13 @@
 		<!-- Main content area - scrollable -->
 		<div class="flex-1 min-h-0 overflow-y-auto custom-scrollbar p-4 space-y-6">
 			<p class="text-sm text-gray-600 dark:text-gray-400 mt-1">
-				<b>Description</b><br>
-				This tool assists in developing the DRAFT section related to  Facilities & Equipment for grant proposals where sponsors are NSF (National Science Foundation) and NIH (National Institute of Health).<br><br>
-				Users should complete only those sections that are applicable to their research; any sections left blank will be omitted from the final document. Large Language Model (LLM) will generate responses in a template form.<br><br>
-				<b>Disclaimer</b><br>
-				The Al-generated text is intended as a DRAFT.<br><br>
-				All content must be carefully reviewed, verified, and revised by the researcher to ensure accuracy and compliance with the sponsor's requirements, and adherence to institutional policies. Researchers are solely responsible for the final submitted materials.
-
-			</p>
+					<b>Description</b><br>
+					This tool assists in developing the DRAFT section related to  Facilities & Equipment for grant proposals where sponsors are NSF (National Science Foundation) and NIH (National Institute of Health).<br><br>
+					Users should complete only those sections that are applicable to their research; any sections left blank will be omitted from the final document. Large Language Model (LLM) will generate responses in a template form.<br><br>
+					<b>Disclaimer</b><br>
+					The Al-generated text is intended as a DRAFT.<br><br>
+					As LLMs are inherently non-deterministic, the output is not guaranteed to be consistent or predictable. As a result, all content must be carefully reviewed, verified, and revised by the researcher to ensure accuracy and compliance with the sponsor's requirements, and adherence to institutional policies. Researchers are solely responsible for the final submitted materials.
+				</p>
 
 			<!-- Sponsor Selection -->
 			<div>

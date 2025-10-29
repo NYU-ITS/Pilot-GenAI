@@ -1701,7 +1701,7 @@ CHROMA_DATA_PATH = f"{DATA_DIR}/vector_db"
 
 if VECTOR_DB == "chroma":
     import chromadb
-
+    
     CHROMA_TENANT = os.environ.get("CHROMA_TENANT", chromadb.DEFAULT_TENANT)
     CHROMA_DATABASE = os.environ.get("CHROMA_DATABASE", chromadb.DEFAULT_DATABASE)
     CHROMA_HTTP_HOST = os.environ.get("CHROMA_HTTP_HOST", "")
@@ -2080,9 +2080,29 @@ BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL = UserScopedConfig(
 RAG_WEB_SEARCH_DOMAIN_FILTER_LIST = UserScopedConfig(
     "rag.web.search.domain.filter_list",
     [
+        "nyu.edu",
+        "nsf.gov",
         # "wikipedia.com",
         # "wikimedia.org",
         # "wikidata.org",
+    ],
+)
+
+# Website blocklist - URLs that should be blocked even if they're from allowed domains
+RAG_WEB_SEARCH_WEBSITE_BLOCKLIST = UserScopedConfig(
+    "rag.web.search.website.blocklist",
+    [
+        "https://med.nyu.edu/research/scientific-cores-shared-resources/high-performance-computing-core",
+    ],
+)
+
+# Internal facilities specific sites for NYU HPC searches
+RAG_WEB_SEARCH_INTERNAL_FACILITIES_SITES = UserScopedConfig(
+    "rag.web.search.internal.facilities.sites",
+    [
+        "https://sites.google.com/nyu.edu/nyu-hpc/",
+        "https://www.nyu.edu/life/information-technology/research-computing-services/high-performance-computing.html",
+        "https://www.nyu.edu/life/information-technology/research-computing-services/high-performance-computing/high-performance-computing-nyu-it.html"
     ],
 )
 
