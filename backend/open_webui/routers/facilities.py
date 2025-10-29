@@ -1,10 +1,19 @@
 from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import Dict, List, Optional
 import logging
 import os
 import json
 from urllib.parse import urlparse
+from io import BytesIO
+from docx import Document
+from docx.shared import Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from datetime import datetime
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 
 from open_webui.models.knowledge import Knowledges
@@ -19,9 +28,7 @@ FACILITIES_PROMPT = """You are an expert grant writer specializing in the 'Facil
 Your job is to expand and professionally refine the user's section draft using:
 1.  User Input (this forms the base and must be preserved).
 2.  PDF Research Chunks from relevant proposals or facility descriptions.
-3.  Trusted Web Snippets:
-   - For most sections: snippets from `nyu.edu` or `nsf.gov`.
-   - For Internal Facilities (NYU): only snippets from the specified trusted NYU HPC/Core Facilities pages.
+3.  Trusted Web Snippets
 
 
 ---
@@ -34,9 +41,15 @@ Your job is to expand and professionally refine the user's section draft using:
 > *Draft:* "The Robotics Lab features 10 industrial-grade robotic manipulators and an advanced OptiTrack motion capture system for multi-agent interaction studies [Robotics_Lab_Equipment.pdf]."
 
 **Example 2**  
-> *User:* "We use NYU's HPC system with 1000 GPUs."  
-> *Context:* `<source><source_id>https://www.nyu.edu/hpc</source_id><source_context>NYU HPC cluster with 1,024 NVIDIA A100 GPUs</source_context></source>`
-> *Draft:* "High-performance computing is supported by NYU's HPC cluster with 1,024 NVIDIA A100 GPUs [https://www.nyu.edu/hpc]."
+> *User:* "We use our university's HPC system with 1000 GPUs."  
+> *Context:* `<source><source_id>HPC_Cluster_Overview.pdf</source_id><source_context>University HPC cluster with 1,024 NVIDIA A100 GPUs</source_context></source>`
+> *Draft:* "High-performance computing is supported by the university's HPC cluster with 1,024 NVIDIA A100 GPUs [HPC_Cluster_Overview.pdf]."
+
+**Example 3 - Multiple Sources**  
+> *User:* "Our wireless lab has software-defined radios and spectrum analyzers."  
+> *Context:* `<source><source_id>Lab_Inventory_2023.pdf</source_id><source_context>12 USRP B210 software-defined radios</source_context></source>` and `<source><source_id>Equipment_Manual_2024.pdf</source_id><source_context>Keysight N9020A spectrum analyzers</source_context></source>`
+> *Draft:* "The wireless communications laboratory is equipped with 12 USRP B210 software-defined radios [Lab_Inventory_2023.pdf] and Keysight N9020A spectrum analyzers [Equipment_Manual_2024.pdf] for advanced signal processing and spectrum analysis."
+> *NOTE:* Use separate brackets [source1.pdf] [source2.pdf] NOT combined [source1.pdf; source2.pdf]
 
 ---
 
@@ -65,17 +78,21 @@ Your job is to expand and professionally refine the user's section draft using:
 - Use specific technical details, numbers, and concrete information from the sources.
 - Write comprehensive, detailed content that demonstrates expertise and thoroughness.
 **CRITICAL CITATION RULES - FOLLOW EXACTLY:**
-- **MANDATORY: You MUST use source names/links in square brackets like [filename.pdf] or [https://url.com].**
+- **IMPORTANT: When web search is disabled, ONLY cite PDF files and document names - NEVER cite web URLs even if they appear in sources.**
 - **ONLY use source names/links that appear in `<source_id>` tags in the context above.**
 - **Look at the context above and find the exact `<source_id>` values.**
 - **If you see `<source><source_id>HRamani_NSFCAREER_SUBMITTED_Proposal_20240723_NSF.pdf</source_id>`, you MUST use [HRamani_NSFCAREER_SUBMITTED_Proposal_20240723_NSF.pdf].**
-- **If you see `<source><source_id>https://www.nyu.edu/hpc</source_id>`, you MUST use [https://www.nyu.edu/hpc].**
+
 - **NEVER use numbered citations like [1], [2], [3] - ALWAYS use the actual source name/link.**
 - **Do NOT use source names/links that are NOT in the `<source_id>` tags.**
 - **If no `<source_id>` tags are provided, do not include any citations.**
+- **If web search is disabled, do NOT include any web URLs as citations, even if they appear in knowledge base sources.**
+- **IMPORTANT: Use SEPARATE citations for each source - [source1.pdf] [source2.pdf] NOT [source1.pdf; source2.pdf].**
+- **NEVER combine multiple sources in one bracket with semicolons or commas.**
 - Never invent or assume data not present in input or sources.
 - If no relevant info is found, return only the user's input — improved stylistically.
 - Focus on creating professional, grant-worthy content that showcases facilities and capabilities.
+- **IMPORTANT: Do NOT add "Facilities, Equipment, and Other Resources" as a subtitle - just write the content for the section directly.**
 
 Write a polished, comprehensive section suitable for direct inclusion in an NSF or NIH grant.
 """
@@ -86,7 +103,8 @@ class FacilitiesRequest(BaseModel):
     sponsor: str  
     form_data: Dict[str, str]  
     model: str  
-    web_search_enabled: bool = False  
+    web_search_enabled: bool = False
+    files: Optional[List[Dict]] = None
 
 class FacilitiesResponse(BaseModel):
     success: bool
@@ -118,7 +136,11 @@ def facilities_web_search(query: str, request: Request, user) -> tuple[str, List
      web search for facilities - uses existing NAGA Tavily configuration
     """
     try:
-    
+        # Check if web search is enabled for this user
+        if not request.app.state.config.ENABLE_RAG_WEB_SEARCH.get(user.email):
+            logging.info(f"Web search is disabled for user: {user.email}")
+            return "", [], []
+        
         if not request.app.state.config.TAVILY_API_KEY:
             logging.warning("TAVILY_API_KEY not configured in NAGA")
             return "", [], []
@@ -137,18 +159,59 @@ def facilities_web_search(query: str, request: Request, user) -> tuple[str, List
         urls = []
         scores = []
         
-        for domain in allowed_domains:
-            logging.info(f"Searching domain: {domain}")
+        if allowed_domains:
+            # Search specific domains
+            for domain in allowed_domains:
+                logging.info(f"Searching domain: {domain}")
+                try:
+                    site_query = f"site:{domain} {query}"
+                    results = search_tavily(
+                        api_key=tavily_api_key,
+                        query=site_query,
+                        count=3,
+                        filter_list=None,
+                        blocklist=blocklist
+                    )
+                    logging.info(f"Search results for {domain}: {len(results) if results else 0} results")
+                    
+                    if results:
+                        for result in results:
+                            url = result.link.strip()
+                            content = result.snippet.strip()
+                            score = result.score if hasattr(result, 'score') else 0.1
+                            logging.info(f"Found result: {url[:50]}... with score: {score}")
+                            
+                            # Parse domain and validate it's from allowed domains
+                            from urllib.parse import urlparse
+                            parsed_domain = urlparse(url).netloc
+                            
+                            # More strict domain validation - must end with allowed domains
+                            is_allowed_domain = any(parsed_domain.endswith(allowed) for allowed in allowed_domains)
+                            is_blocked = any(url.startswith(bad) for bad in blocklist)
+                            
+                            if is_allowed_domain and not is_blocked:
+                                snippets.append(content)
+                                urls.append(url)
+                                scores.append(score)
+                                logging.info(f"Added to results: {url} with score: {score} (domain: {parsed_domain})")
+                            else:
+                                logging.info(f"Blocked by filter: {url} (domain: {parsed_domain}, allowed: {is_allowed_domain}, blocked: {is_blocked})")
+                    else:
+                        logging.info(f"No results for domain: {domain}")
+                except Exception as e:
+                    logging.error(f"Error searching domain {domain}: {e}")
+        else:
+            # No domain filter - search the entire web (like regular chat)
+            logging.info(f"No domain filter configured, searching entire web for query: {query}")
             try:
-                site_query = f"site:{domain} {query}"
                 results = search_tavily(
                     api_key=tavily_api_key,
-                    query=site_query,
+                    query=query,
                     count=3,
                     filter_list=None,
                     blocklist=blocklist
                 )
-                logging.info(f"Search results for {domain}: {len(results) if results else 0} results")
+                logging.info(f"Web search results: {len(results) if results else 0} results")
                 
                 if results:
                     for result in results:
@@ -157,25 +220,22 @@ def facilities_web_search(query: str, request: Request, user) -> tuple[str, List
                         score = result.score if hasattr(result, 'score') else 0.1
                         logging.info(f"Found result: {url[:50]}... with score: {score}")
                         
-                        # Parse domain and validate it's from allowed domains
+                        # Parse domain and validate it's not blocked
                         from urllib.parse import urlparse
                         parsed_domain = urlparse(url).netloc
-                        
-                        # More strict domain validation - must end with allowed domains
-                        is_allowed_domain = any(parsed_domain.endswith(allowed) for allowed in allowed_domains)
                         is_blocked = any(url.startswith(bad) for bad in blocklist)
                         
-                        if is_allowed_domain and not is_blocked:
+                        if not is_blocked:
                             snippets.append(content)
                             urls.append(url)
                             scores.append(score)
-                            logging.info(f"Added to results: {url} with score: {score} (domain: {parsed_domain})")
+                            logging.info(f"Added to results: {url} with score: {score}")
                         else:
-                            logging.info(f"Blocked by filter: {url} (domain: {parsed_domain}, allowed: {is_allowed_domain}, blocked: {is_blocked})")
+                            logging.info(f"Blocked by blocklist: {url}")
                 else:
-                    logging.info(f"No results for domain: {domain}")
+                    logging.info(f"No web search results found")
             except Exception as e:
-                logging.error(f"Error searching domain {domain}: {e}")
+                logging.error(f"Error in web search: {e}")
         
         return "\n\n".join(snippets), urls, scores
         
@@ -243,14 +303,28 @@ def facilities_web_search_specific_sites(query: str, allowed_sites: List[str], r
         logging.error(f"Facilities specific site web search failed: {e}")
         return f"Web search failed: {e}", [], []
 
-def search_knowledge_base(query: str, user_id: str, request: Request, k: int = 5) -> List[tuple]:
-    """Simple knowledge base search with real relevance scores"""
+def search_knowledge_base(query: str, user_id: str, request: Request, model, k: int = 5) -> List[tuple]:
+    """Model-dependent knowledge base search"""
     try:
-        knowledge_bases = Knowledges.get_knowledge_bases_by_user_id(user_id, "read")
-        collection_names = [kb.id for kb in knowledge_bases]
+        # Get model knowledge configuration (same as regular chat)
+        model_knowledge = model.get("info", {}).get("meta", {}).get("knowledge", False)
+        
+        if not model_knowledge:
+            logging.warning("No knowledge bases configured for this model")
+            return []
+        
+        # Extract collection names from model configuration
+        collection_names = []
+        for item in model_knowledge:
+            if item.get("collection_name"):
+                collection_names.append(item.get("collection_name"))
+            elif item.get("collection_names"):
+                collection_names.extend(item.get("collection_names", []))
+            elif item.get("id"):
+                collection_names.append(item.get("id"))
         
         if not collection_names:
-            logging.warning("No knowledge bases found for user")
+            logging.warning("No knowledge base collections found in model configuration")
             return []
         
         try:
@@ -345,8 +419,18 @@ async def generate_facilities_response(request: Request, form_data: FacilitiesRe
     if not request.app.state.config.ENABLE_FACILITIES.get(user.email):
         raise HTTPException(status_code=403, detail="Facilities feature is not enabled for this user")
     try:
+        logging.info(f"DEBUG: Received facilities request with files: {form_data.files}")
+        logging.info(f"DEBUG: Files count: {len(form_data.files) if form_data.files else 0}")
+        if form_data.files:
+            for i, file in enumerate(form_data.files):
+                logging.info(f"DEBUG: File {i}: {file}")
         if form_data.sponsor not in ["NSF", "NIH"]:
             raise HTTPException(status_code=400, detail="Invalid sponsor. Must be 'NSF' or 'NIH'")
+        
+        # Get model information for knowledge base access
+        model = request.app.state.MODELS.get(form_data.model)
+        if not model:
+            raise HTTPException(status_code=400, detail="Model not found")
         
         section_labels = get_section_labels(form_data.sponsor)
         
@@ -376,6 +460,31 @@ async def generate_facilities_response(request: Request, form_data: FacilitiesRe
                 error="Please fill in at least one form field"
             )
         
+        # Process attached files
+        attached_files_sources = []
+        if form_data.files:
+            logging.info(f"Processing {len(form_data.files)} attached files for facilities generation")
+            try:
+                # Import the file processing function from middleware
+                from open_webui.utils.middleware import chat_completion_files_handler
+                
+                # Create a mock body structure for file processing
+                mock_body = {
+                    "metadata": {
+                        "files": form_data.files
+                    },
+                    "messages": [{"role": "user", "content": "Facilities generation with attached files"}]
+                }
+                
+                processed_body, file_flags = await chat_completion_files_handler(request, mock_body, user)
+                attached_files_sources = file_flags.get("sources", [])
+                
+                logging.info(f"Processed attached files, found {len(attached_files_sources)} sources")
+                
+            except Exception as e:
+                logging.error(f"Error processing attached files: {e}")
+                # Continue without attached files if processing fails
+        
         
         section_outputs = {}
         all_sources = []
@@ -392,7 +501,23 @@ async def generate_facilities_response(request: Request, form_data: FacilitiesRe
             query = f"{section}: {user_text}"
             
             
-            search_results = search_knowledge_base(query, user.id, request, k=5)
+            search_results = search_knowledge_base(query, user.id, request, model, k=5)
+            
+            # Add attached files sources to the search results
+            attached_file_results = []
+            if attached_files_sources:
+                for source in attached_files_sources:
+                    for doc in source.get("document", []):
+                        attached_file_results.append((
+                            doc, 
+                            source.get("source", {}).get("name", "attached_file"), 
+                            source.get("distances", [0.1])[0] if source.get("distances") else 0.1
+                        ))
+                
+                logging.info(f"Added {len(attached_file_results)} attached file sources for {section}")
+            
+            # Combine knowledge base and attached file results
+            all_search_results = search_results + attached_file_results
             
              
             retrieved_chunks = []
@@ -400,7 +525,7 @@ async def generate_facilities_response(request: Request, form_data: FacilitiesRe
             
             
             source_groups = {}
-            for doc, source, score in search_results:
+            for doc, source, score in all_search_results:
                 if source not in source_groups:
                     source_groups[source] = []
                 source_groups[source].append((doc, score))
@@ -416,7 +541,7 @@ async def generate_facilities_response(request: Request, form_data: FacilitiesRe
                     retrieved_chunks.append(f"<source><source_id>{source}</source_id><source_context>{doc}</source_context></source>")
                 
                 section_sources.append({
-                    "source": {"name": source},
+                    "source": {"id": source, "name": source},
                     "document": docs,  
                     "metadata": [{"source": source, "name": source}] * len(docs),
                     "distances": real_distances 
@@ -429,8 +554,8 @@ async def generate_facilities_response(request: Request, form_data: FacilitiesRe
             logging.info(f"Added {len(section_sources)} sources to all_sources for {section}")
             logging.info(f"Sources added: {[s.get('source', {}).get('name', 'unknown') for s in section_sources]}")
             
-            logging.info(f"Found {len(search_results)} chunks for {section}")
-            logging.info(f"Sources found: {[source for _, source, _ in search_results]}")
+            logging.info(f"Found {len(all_search_results)} total chunks for {section} (KB: {len(search_results)}, Attached: {len(attached_file_results)})")
+            logging.info(f"All sources found: {[source for _, source, _ in all_search_results]}")
             
             web_content = ""
             web_links = []
@@ -472,7 +597,7 @@ async def generate_facilities_response(request: Request, form_data: FacilitiesRe
                             
                             # Create separate source for each URL (like existing NAGA system)
                             all_sources.append({
-                                "source": {"name": url, "url": url},  # Use URL as both name and url
+                                "source": {"id": url, "name": url, "url": url},  # Use URL as both name and url
                                 "document": [content_part.strip()],
                                 "metadata": [{"source": url, "name": url}],
                                 "distances": web_distances  # Use real distances/scores
@@ -486,7 +611,11 @@ async def generate_facilities_response(request: Request, form_data: FacilitiesRe
                 logging.info(f"Web search disabled for {section}")
             
             pdf_sources = "\n\n".join(retrieved_chunks) if retrieved_chunks else "No relevant PDF documents found in knowledge base."
-            web_sources = "\n\n".join(web_source_tags) if web_source_tags else "No relevant web sources found."
+            # Only include web sources if web search is enabled
+            if form_data.web_search_enabled:
+                web_sources = "\n\n".join(web_source_tags) if web_source_tags else "No relevant web sources found."
+            else:
+                web_sources = "Web search is disabled for this request."
             
             prompt = FACILITIES_PROMPT.format(
                 section=section,
@@ -502,8 +631,8 @@ async def generate_facilities_response(request: Request, form_data: FacilitiesRe
                 cleaned_content = generated_content.strip()
                 
                 if cleaned_content.startswith('Error:') or 'Connection aborted' in cleaned_content:
-                    logging.warning(f"LLM returned error for {section}, using user input as fallback")
-                    section_outputs[section] = user_text
+                    logging.error(f"LLM returned error for {section}: {cleaned_content}")
+                    raise Exception(f"LLM generation failed for {section}: {cleaned_content}")
                 else:
                     section_outputs[section] = cleaned_content
                     
@@ -513,14 +642,19 @@ async def generate_facilities_response(request: Request, form_data: FacilitiesRe
                     citations = re.findall(r'\[([^\]]+)\]', cleaned_content)
                     for citation in citations:
                         # Only add if it looks like a source (contains .pdf, .doc, http, or is a filename)
+                        # But exclude web URLs if web search is disabled
                         if ('.pdf' in citation or '.doc' in citation or 
-                            citation.startswith('http') or 
-                            len(citation) > 10):  # Likely a filename
+                            (citation.startswith('http') and form_data.web_search_enabled) or 
+                            (len(citation) > 10 and not citation.startswith('http'))):  # Likely a filename, not a URL
                             cited_sources.add(citation)
                     
                     logging.info(f"Generated content for {section}: {len(cleaned_content)} chars")
                     logging.info(f"All citations found in {section}: {citations}")
-                    valid_citations = [c for c in citations if '.pdf' in c or '.doc' in c or c.startswith('http') or len(c) > 10]
+                    # Filter citations based on web search status
+                    if form_data.web_search_enabled:
+                        valid_citations = [c for c in citations if '.pdf' in c or '.doc' in c or c.startswith('http') or len(c) > 10]
+                    else:
+                        valid_citations = [c for c in citations if '.pdf' in c or '.doc' in c or (len(c) > 10 and not c.startswith('http'))]
                     logging.info(f"Valid source citations in {section}: {valid_citations}")
                     
                     # Separate PDF and web citations for better debugging
@@ -532,7 +666,7 @@ async def generate_facilities_response(request: Request, form_data: FacilitiesRe
                 
             except Exception as e:
                 logging.error(f"Failed to generate content for {section}: {e}")
-                section_outputs[section] = user_text
+                raise Exception(f"Failed to generate content for {section}: {str(e)}")
         
         if not section_outputs:
             return FacilitiesResponse(
@@ -570,7 +704,8 @@ async def generate_facilities_response(request: Request, form_data: FacilitiesRe
             message=f"Successfully generated {len(section_outputs)} sections for {form_data.sponsor}",
             content=content,
             sections=section_outputs, 
-            sources=formatted_sources
+            sources=formatted_sources,
+            error=None  # No error for successful generation
         )
         
     except Exception as e:
@@ -600,4 +735,133 @@ async def get_facilities_sections(sponsor: str, request: Request, user=Depends(g
     except Exception as e:
         logging.error(f"Error getting sections for {sponsor}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get sections: {str(e)}")
+
+
+class DownloadRequest(BaseModel):
+    sections: Dict[str, str]
+    format: str  # 'pdf' or 'word'
+
+
+def generate_facilities_pdf(sections: Dict[str, str]) -> bytes:
+    """Generate PDF from facilities sections """
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    story = []
+    
+    
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=16,
+        spaceAfter=30,
+        alignment=1  
+    )
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontSize=14,
+        spaceAfter=12,
+        spaceBefore=20
+    )
+    normal_style = styles['Normal']
+    
+    
+    story.append(Paragraph("Facilities Template", title_style))
+    story.append(Spacer(1, 20))
+    
+    
+    for section_label, section_text in sections.items():
+        if section_text and section_text.strip():
+            
+            story.append(Paragraph(section_label, heading_style))
+            
+            
+            escaped_text = section_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            
+            formatted_text = escaped_text.replace('\n', '<br/>')
+            
+            story.append(Paragraph(formatted_text, normal_style))
+            story.append(Spacer(1, 12))
+    
+    
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def generate_facilities_word(sections: Dict[str, str]) -> bytes:
+    """Generate Word document from facilities sections"""
+    doc = Document()
+    
+    
+    title_paragraph = doc.add_paragraph()
+    title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_run = title_paragraph.add_run('Facilities Template')
+    title_run.bold = True
+    title_run.font.size = Pt(16)
+    
+    title_run.font.color.rgb = RGBColor(0, 0, 0)
+    title_run.font.color.theme_color = None  
+    
+    doc.add_paragraph()
+    
+
+    for section_label, section_text in sections.items():
+        if section_text and section_text.strip():
+        
+            heading_paragraph = doc.add_paragraph()
+            heading_run = heading_paragraph.add_run(section_label)
+            heading_run.bold = True
+            heading_run.font.size = Pt(14)
+
+            heading_run.font.color.rgb = RGBColor(0, 0, 0)
+            heading_run.font.color.theme_color = None
+            
+            doc.add_paragraph(section_text)
+    
+    buffer = BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+@router.post("/download")
+async def download_facilities_document(
+    request: Request,
+    download_data: DownloadRequest,
+    user=Depends(get_verified_user)
+):
+    """
+    Download facilities document as PDF or Word
+    """
+    if not request.app.state.config.ENABLE_FACILITIES.get(user.email):
+        raise HTTPException(status_code=403, detail="Facilities feature is not enabled for this user")
+    
+    try:
+        if download_data.format not in ["pdf", "word"]:
+            raise HTTPException(status_code=400, detail="Invalid format. Must be 'pdf' or 'word'")
+        
+        if not download_data.sections:
+            raise HTTPException(status_code=400, detail="No sections provided")
+        
+        # Generate document based on format
+        if download_data.format == "pdf":
+            content = generate_facilities_pdf(download_data.sections)
+            media_type = "application/pdf"
+            filename = "facilities_draft.pdf"
+        else:  # word
+            content = generate_facilities_word(download_data.sections)
+            media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            filename = "facilities_draft.docx"
+        
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    except Exception as e:
+        logging.error(f"Error generating {download_data.format} document: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate document: {str(e)}")
 
