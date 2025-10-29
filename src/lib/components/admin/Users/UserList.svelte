@@ -12,7 +12,7 @@
 
 	import { toast } from 'svelte-sonner';
 
-	import { updateUserRole, getUsers, deleteUserById } from '$lib/apis/users';
+	import { updateUserRole, getUsers, deleteUserById, toggleCoAdminStatus } from '$lib/apis/users';
 
 	import Pagination from '$lib/components/common/Pagination.svelte';
 	import ChatBubbles from '$lib/components/icons/ChatBubbles.svelte';
@@ -35,15 +35,16 @@
 		'ms15138@nyu.edu',
 		'mb484@nyu.edu',
 		'sm11538@nyu.edu',
-		'cg4532@nyu.edu',
-		'jy4421@nyu.edu',
-		'ht2490@nyu.edu'
+		'cg4532@nyu.edu'
 	];
 
 	// function to override the label if the user is truly "admin" + in SUPER_ADMIN_EMAILS
 	function getRoleLabel(user) {
 		if (user.role === 'admin' && SUPER_ADMIN_EMAILS.includes(user.email)) {
 			return 'super admin';
+		}
+		if (user.role === 'admin' && user.info?.is_co_admin) {
+			return 'co-admin';
 		}
 		return user.role;
 	}
@@ -71,6 +72,22 @@
 			users = await getUsers(localStorage.token);
 		}
 	};
+
+	const toggleCoAdminHandler = async (id) => {
+		const res = await toggleCoAdminStatus(localStorage.token, id).catch((error) => {
+			toast.error(`${error}`);
+			return null;
+		});
+
+		if (res) {
+			users = await getUsers(localStorage.token);
+		}
+	};
+
+	// Helper function to check if current user is super admin
+	function isCurrentUserSuperAdmin() {
+		return SUPER_ADMIN_EMAILS.includes($user.email);
+	}
 
 	const deleteUserHandler = async (id) => {
 		const res = await deleteUserById(localStorage.token, id).catch((error) => {
@@ -349,23 +366,47 @@
 						<button
 							class=" translate-y-0.5"
 							on:click={() => {
-								if (user.role === 'user') {
-									updateRoleHandler(user.id, 'admin');
-								} else if (user.role === 'pending') {
-									updateRoleHandler(user.id, 'user');
+								// Skip super admins - they can't be changed
+								if (SUPER_ADMIN_EMAILS.includes(user.email)) {
+									return;
+								}
+
+								if (isCurrentUserSuperAdmin()) {
+									// Super admin gets full 4-state cycle: pending → user → admin → co-admin → pending
+									if (user.role === 'pending') {
+										updateRoleHandler(user.id, 'user');
+									} else if (user.role === 'user') {
+										updateRoleHandler(user.id, 'admin');
+									} else if (user.role === 'admin' && !user.info?.is_co_admin) {
+										// Admin → Co-Admin
+										toggleCoAdminHandler(user.id);
+									} else if (user.role === 'admin' && user.info?.is_co_admin) {
+										// Co-Admin → Pending (and remove co-admin status)
+										toggleCoAdminHandler(user.id); // Remove co-admin status first
+										setTimeout(() => updateRoleHandler(user.id, 'pending'), 100); // Then change role
+									}
 								} else {
-									updateRoleHandler(user.id, 'pending');
+									// Regular admin gets 3-state cycle: pending → user → admin → pending
+									if (user.role === 'user') {
+										updateRoleHandler(user.id, 'admin');
+									} else if (user.role === 'pending') {
+										updateRoleHandler(user.id, 'user');
+									} else {
+										updateRoleHandler(user.id, 'pending');
+									}
 								}
 							}}
 						>
 							<Badge
 								type={getRoleLabel(user) === 'super admin'
 									? 'super'
-									: user.role === 'admin'
-										? 'info'
-										: user.role === 'user'
-											? 'success'
-											: 'muted'}
+									: getRoleLabel(user) === 'co-admin'
+										? 'warning'
+										: user.role === 'admin'
+											? 'info'
+											: user.role === 'user'
+												? 'success'
+												: 'muted'}
 								content={$i18n.t(getRoleLabel(user))}
 							/>
 						</button>

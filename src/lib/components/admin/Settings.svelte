@@ -26,9 +26,7 @@
 	'cg4532@nyu.edu',
 	'ms15138@nyu.edu',
 	'mb484@nyu.edu',
-	'jy4421@nyu.edu',
-	'sm11538@nyu.edu',
-	'ht2490@nyu.edu'
+	'sm11538@nyu.edu'
 	];
 
 	const canViewRestrictedTabs = () => SPECIAL_ADMIN_EMAILS.includes($user?.email);
@@ -262,7 +260,6 @@
 		</button>
 	{/if}
 	
-	{#if canViewRestrictedTabs()}
 		<button
 			class="px-0.5 py-1 min-w-fit rounded-lg flex-1 md:flex-none flex text-right transition {selectedTab ===
 			'audio'
@@ -289,7 +286,7 @@
 			</div>
 			<div class=" self-center">{$i18n.t('Audio')}</div>
 		</button>
-	{/if}
+
 
 	{#if canViewRestrictedTabs()}	
 		<button
