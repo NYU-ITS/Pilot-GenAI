@@ -1,7 +1,8 @@
 import logging
 import os
 import uuid
-from typing import Optional, Union
+from typing import Optional, Union, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import asyncio
 import requests
@@ -12,8 +13,15 @@ from langchain.retrievers import ContextualCompressionRetriever, EnsembleRetriev
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
+try:
+    from portkey_ai import Portkey
+    PORTKEY_SDK_AVAILABLE = True
+except ImportError:
+    PORTKEY_SDK_AVAILABLE = False
+    log.warning("Portkey SDK not available. Install portkey-ai package for embedding support.")
 
-from open_webui.config import VECTOR_DB
+
+from open_webui.config import VECTOR_DB, RAG_EMBEDDING_MODEL
 from open_webui.retrieval.vector.connector import VECTOR_DB_CLIENT
 from open_webui.utils.misc import get_last_user_message, calculate_sha256_string
 
@@ -236,22 +244,162 @@ def query_collection(
     k: int,
 ) -> dict:
     results = []
-    for query in queries:
-        query_embedding = embedding_function(query)
-        for collection_name in collection_names:
-            if collection_name:
-                try:
-                    result = query_doc(
-                        collection_name=collection_name,
-                        k=k,
-                        query_embedding=query_embedding,
-                    )
-                    if result is not None:
-                        results.append(result.model_dump())
-                except Exception as e:
-                    log.exception(f"Error when querying the collection: {e}")
+    
+    # Handle edge cases
+    if not queries or len(queries) == 0:
+        log.warning("query_collection called with empty queries list")
+        return merge_and_sort_query_results(results, k=k, reverse=True) if VECTOR_DB != "chroma" else merge_and_sort_query_results(results, k=k, reverse=False)
+    
+    if not collection_names or len(collection_names) == 0:
+        log.warning("query_collection called with empty collection_names list")
+        return merge_and_sort_query_results(results, k=k, reverse=True) if VECTOR_DB != "chroma" else merge_and_sort_query_results(results, k=k, reverse=False)
+    
+    # Filter out empty queries
+    queries = [q for q in queries if q and q.strip()]
+    if not queries:
+        log.warning("All queries were empty after filtering")
+        return merge_and_sort_query_results(results, k=k, reverse=True) if VECTOR_DB != "chroma" else merge_and_sort_query_results(results, k=k, reverse=False)
+    
+    # Batch embedding generation for multiple queries (faster than individual calls)
+    # The embedding_function supports both single strings and lists of strings
+    query_embedding_map = {}
+    try:
+        if len(queries) > 1:
+            # Batch embed all queries at once - significantly faster for multiple queries
+            log.debug(f"Batching {len(queries)} queries for embedding generation")
+            query_embeddings = embedding_function(queries)
+            
+            # Handle different return formats:
+            # - List of embeddings: [[emb1], [emb2], ...] or [emb1, emb2, ...]
+            # - Single embedding: [emb1] or just emb1 (shouldn't happen for batch)
+            if isinstance(query_embeddings, list):
+                if len(query_embeddings) == len(queries):
+                    # Check if embeddings are nested lists or flat lists
+                    if len(query_embeddings) > 0 and isinstance(query_embeddings[0], list):
+                        # Already in correct format: [[emb1], [emb2], ...]
+                        # Validate embeddings are not empty
+                        for i, emb in enumerate(query_embeddings):
+                            if isinstance(emb, list) and len(emb) > 0:
+                                query_embedding_map[queries[i]] = emb
+                            else:
+                                log.warning(f"Empty or invalid embedding for query {i}: {queries[i]}")
+                    else:
+                        # Flat list: might be single embedding or needs wrapping
+                        # If length matches, assume each element is an embedding vector
+                        for i, emb in enumerate(query_embeddings):
+                            if isinstance(emb, list) and len(emb) > 0:
+                                query_embedding_map[queries[i]] = emb
+                            else:
+                                log.warning(f"Empty or invalid embedding for query {i}: {queries[i]}")
+                else:
+                    # Mismatch - fallback to individual calls
+                    log.warning(f"Batch embedding returned {len(query_embeddings)} results for {len(queries)} queries, falling back to individual calls")
+                    raise ValueError("Batch embedding result length mismatch")
             else:
-                pass
+                # Unexpected return type - fallback
+                log.warning(f"Batch embedding returned unexpected type: {type(query_embeddings)}, falling back to individual calls")
+                raise ValueError("Unexpected batch embedding return type")
+        elif len(queries) == 1:
+            # Single query - embed normally
+            embedding = embedding_function(queries[0])
+            # Ensure it's a list (embedding functions should return list[float])
+            if isinstance(embedding, list) and len(embedding) > 0:
+                query_embedding_map[queries[0]] = embedding
+            else:
+                # Invalid embedding - log and skip
+                log.warning(f"Empty or invalid embedding for single query: {queries[0]}")
+                if not isinstance(embedding, list):
+                    # Try wrapping as fallback
+                    query_embedding_map[queries[0]] = [embedding] if embedding else None
+    except Exception as e:
+        log.exception(f"Error generating batch embeddings: {e}")
+        # Fallback to individual embedding generation
+        log.debug("Falling back to individual embedding generation")
+        for query in queries:
+            try:
+                embedding = embedding_function(query)
+                if isinstance(embedding, list) and len(embedding) > 0:
+                    query_embedding_map[query] = embedding
+                elif isinstance(embedding, list) and len(embedding) == 0:
+                    log.warning(f"Empty embedding returned for query: {query}")
+                else:
+                    # Wrap non-list embeddings
+                    query_embedding_map[query] = [embedding] if embedding else None
+            except Exception as embed_error:
+                log.exception(f"Error embedding query '{query}': {embed_error}")
+                continue
+    
+    # Validate we have at least some embeddings
+    if not query_embedding_map:
+        log.error("Failed to generate embeddings for any queries")
+        return merge_and_sort_query_results(results, k=k, reverse=True) if VECTOR_DB != "chroma" else merge_and_sort_query_results(results, k=k, reverse=False)
+    
+    # Parallelize query processing for faster RAG retrieval
+    # Note: Thread-safety depends on the vector DB implementation:
+    # - Postgres (pgvector): Uses scoped_session - thread-safe
+    # - SQLite-based DBs: May have issues with concurrent access
+    # - Chroma/Qdrant/Milvus: Generally thread-safe if using separate clients per thread
+    def process_query_collection_pair(query: str, collection_name: str, query_embedding: list[float]):
+        """Process a single query against a single collection using pre-computed embedding"""
+        try:
+            if collection_name:
+                result = query_doc(
+                    collection_name=collection_name,
+                    k=k,
+                    query_embedding=query_embedding,
+                )
+                if result is not None:
+                    return result.model_dump()
+        except Exception as e:
+            log.exception(f"Error when querying collection {collection_name} with query: {e}")
+        return None
+    
+    # Create all query-collection pairs with pre-computed embeddings
+    # Filter out None embeddings and ensure embeddings are valid lists
+    query_collection_pairs = []
+    for query in queries:
+        if query not in query_embedding_map:
+            continue
+        embedding = query_embedding_map[query]
+        if embedding is None or not isinstance(embedding, list) or len(embedding) == 0:
+            continue
+        for collection_name in collection_names:
+            query_collection_pairs.append((query, collection_name, embedding))
+    
+    if not query_collection_pairs:
+        log.warning("No valid query-collection pairs after filtering invalid embeddings")
+        return merge_and_sort_query_results(results, k=k, reverse=True) if VECTOR_DB != "chroma" else merge_and_sort_query_results(results, k=k, reverse=False)
+    
+    # For single query-collection pair, process sequentially to avoid overhead
+    # For multiple queries/collections, use parallel processing
+    if len(query_collection_pairs) == 1:
+        # Sequential processing for single query-collection pair
+        query, collection_name, query_embedding = query_collection_pairs[0]
+        if query_embedding and isinstance(query_embedding, list) and len(query_embedding) > 0:
+            result = process_query_collection_pair(query, collection_name, query_embedding)
+            if result is not None:
+                results.append(result)
+    elif len(query_collection_pairs) > 1:
+        # Process in parallel using ThreadPoolExecutor
+        # Limit workers to prevent resource exhaustion and potential SQLite lock issues
+        max_workers = min(len(query_collection_pairs), 10)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_pair = {
+                executor.submit(process_query_collection_pair, query, collection_name, query_embedding): (query, collection_name)
+                for query, collection_name, query_embedding in query_collection_pairs
+                if query_embedding is not None and isinstance(query_embedding, list) and len(query_embedding) > 0
+            }
+            
+            if not future_to_pair:
+                log.warning("No valid futures created for parallel query processing")
+            else:
+                for future in as_completed(future_to_pair):
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            results.append(result)
+                    except Exception as e:
+                        log.exception(f"Error in parallel query processing: {e}")
 
     if VECTOR_DB == "chroma":
         # Chroma uses unconventional cosine similarity, so we don't need to reverse the results
@@ -270,26 +418,86 @@ def query_collection_with_hybrid_search(
     r: float,
 ) -> dict:
     results = []
-    error = False
-    for collection_name in collection_names:
+    errors = []
+    
+    # Handle edge cases
+    if not queries or len(queries) == 0:
+        log.warning("query_collection_with_hybrid_search called with empty queries list")
+        return merge_and_sort_query_results(results, k=k, reverse=True) if VECTOR_DB != "chroma" else merge_and_sort_query_results(results, k=k, reverse=False)
+    
+    if not collection_names or len(collection_names) == 0:
+        log.warning("query_collection_with_hybrid_search called with empty collection_names list")
+        return merge_and_sort_query_results(results, k=k, reverse=True) if VECTOR_DB != "chroma" else merge_and_sort_query_results(results, k=k, reverse=False)
+    
+    # Filter out empty queries
+    queries = [q for q in queries if q and q.strip()]
+    if not queries:
+        log.warning("All queries were empty after filtering in hybrid search")
+        return merge_and_sort_query_results(results, k=k, reverse=True) if VECTOR_DB != "chroma" else merge_and_sort_query_results(results, k=k, reverse=False)
+    
+    # Parallelize query processing for faster RAG retrieval with hybrid search
+    # Note: Thread-safety depends on the vector DB implementation
+    def process_hybrid_search(query: str, collection_name: str):
+        """Process a single query against a single collection with hybrid search"""
         try:
-            for query in queries:
-                result = query_doc_with_hybrid_search(
-                    collection_name=collection_name,
-                    query=query,
-                    embedding_function=embedding_function,
-                    k=k,
-                    reranking_function=reranking_function,
-                    r=r,
-                )
-                results.append(result)
+            result = query_doc_with_hybrid_search(
+                collection_name=collection_name,
+                query=query,
+                embedding_function=embedding_function,
+                k=k,
+                reranking_function=reranking_function,
+                r=r,
+            )
+            return {"result": result, "error": None, "collection": collection_name}
         except Exception as e:
             log.exception(
-                "Error when querying the collection with " f"hybrid_search: {e}"
+                f"Error when querying collection {collection_name} with hybrid_search: {e}"
             )
-            error = True
+            return {"result": None, "error": str(e), "collection": collection_name}
+    
+    # Create all query-collection pairs
+    query_collection_pairs = [
+        (query, collection_name)
+        for collection_name in collection_names
+        for query in queries
+    ]
+    
+    if not query_collection_pairs:
+        log.warning("No valid query-collection pairs for hybrid search")
+        return merge_and_sort_query_results(results, k=k, reverse=True) if VECTOR_DB != "chroma" else merge_and_sort_query_results(results, k=k, reverse=False)
+    
+    # For single query-collection pair, process sequentially to avoid overhead
+    # For multiple queries/collections, use parallel processing
+    if len(query_collection_pairs) == 1:
+        # Sequential processing for single query-collection pair
+        pair_result = process_hybrid_search(query_collection_pairs[0][0], query_collection_pairs[0][1])
+        if pair_result["result"] is not None:
+            results.append(pair_result["result"])
+        elif pair_result["error"]:
+            errors.append(pair_result)
+    else:
+        # Process in parallel using ThreadPoolExecutor
+        # Limit workers to prevent resource exhaustion and potential SQLite lock issues
+        max_workers = min(len(query_collection_pairs), 10)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_pair = {
+                executor.submit(process_hybrid_search, query, collection_name): (query, collection_name)
+                for query, collection_name in query_collection_pairs
+            }
+            
+            for future in as_completed(future_to_pair):
+                try:
+                    pair_result = future.result()
+                    if pair_result["result"] is not None:
+                        results.append(pair_result["result"])
+                    elif pair_result["error"]:
+                        errors.append(pair_result)
+                except Exception as e:
+                    log.exception(f"Error in parallel hybrid search processing: {e}")
+                    errors.append({"result": None, "error": str(e), "collection": "unknown"})
 
-    if error:
+    # Only raise error if ALL searches failed
+    if len(errors) == len(query_collection_pairs):
         raise Exception(
             "Hybrid search failed for all collections. Using Non hybrid search as fallback."
         )
@@ -467,6 +675,21 @@ def get_sources_from_files(
             if not collection_names:
                 log.debug(f"skipping {file} as it has already been extracted")
                 continue
+            
+            # Log collection names being queried for debugging RAG issues
+            log.info(f"[RAG Query] file_id={file.get('id')} | collection_names={list(collection_names)} | queries_count={len(queries)}")
+            
+            # Check if collections actually exist and have documents
+            for coll_name in collection_names:
+                try:
+                    has_coll = VECTOR_DB_CLIENT.has_collection(collection_name=coll_name)
+                    if not has_coll:
+                        log.warning(
+                            f"[RAG Query WARNING] Collection '{coll_name}' does not exist! "
+                            f"File may not have been processed. Check file processing status."
+                        )
+                except Exception as check_err:
+                    log.debug(f"Could not check collection existence: {check_err}")
 
             if full_context:
                 try:
@@ -503,6 +726,17 @@ def get_sources_from_files(
                                 embedding_function=embedding_function,
                                 k=k,
                             )
+                            
+                            # Log if no results were found for debugging
+                            if context is None or not context.get("documents") or not context["documents"][0]:
+                                log.warning(
+                                    f"[RAG Query WARNING] No documents found for file_id={file.get('id')} | "
+                                    f"collections={list(collection_names)} | "
+                                    f"Possible causes: "
+                                    f"1) File not processed yet (check processing_status), "
+                                    f"2) Content extraction failed (empty PDF/scanned image), "
+                                    f"3) Embedding failed during upload"
+                                )
                 except Exception as e:
                     log.exception(e)
 
@@ -612,99 +846,128 @@ def generate_openai_batch_embeddings(
         return None
 
 
-from dataclasses import dataclass
 from typing import Optional, List, Union
 
 
-# Create a dataclass to store the result of the embedding generation
-@dataclass
-class EmbeddingResult:
-    embeddings: Optional[List[List[float]]] = None
-    error: Optional[Exception] = None
-    retriable: bool = False
-
-
-def generate_portkey_batch_embeddings(
+def generate_portkey_embeddings_sdk(
     model: str,
-    texts: list[str],
-    url: str = "",
-    key: str = "",
-    user: UserModel = None,
-    backoff: bool = True,
-    virtual_key: str = "text-embedding-d47871",
-    max_retries: int = 10,
-    initial_backoff: float = 62.0,  #  Using single backoff of 62s once rate limit reached
-) -> EmbeddingResult:
+    texts: Union[str, List[str]],
+    base_url: str,
+    api_key: str,
+    encoding_format: str = "float",
+) -> Union[List[float], List[List[float]]]:
+    """
+    Generate embeddings using Portkey Python SDK.
+    
+    This function uses the official Portkey SDK to generate embeddings for either
+    a single string or a batch of strings. The SDK handles retries, error handling,
+    and HTTP management automatically.
+    
+    Args:
+        model: Portkey model identifier (e.g., "@openai-embedding/text-embedding-3-small")
+        texts: Single string or list of strings to embed
+        base_url: Portkey API base URL (e.g., "https://ai-gateway.apps.cloud.rt.nyu.edu/v1")
+        api_key: Portkey API key
+        encoding_format: "float" for uncompressed embeddings (default)
+        
+    Returns:
+        list[float] if texts is a single string
+        list[list[float]] if texts is a list of strings
+        
+    Raises:
+        ImportError: If portkey_ai SDK is not installed
+        Exception: For any Portkey API errors (handled by SDK)
+    """
+    if not PORTKEY_SDK_AVAILABLE:
+        raise ImportError(
+            "Portkey SDK (portkey_ai) is not installed. "
+            "Install it with: pip install portkey-ai"
+        )
+    
+    # Log API key status for debugging (masked for security)
+    key_status = "EMPTY" if not api_key else f"set ({len(api_key)} chars, ends with ...{api_key[-4:] if len(api_key) >= 4 else '***'})"
+    log.info(
+        f"Portkey SDK init: base_url={base_url}, api_key={key_status}"
+    )
+    
+    if not api_key:
+        log.error(
+            "Portkey API key is empty! This will result in 401 Unauthorized. "
+            "Ensure the admin has configured an embedding API key in Settings > Documents."
+        )
+        raise ValueError(
+            "Portkey API key is required. Please configure it in Settings > Documents > Embedding."
+        )
+    
+    # CRITICAL: Validate base_url is not empty
+    # When base_url is empty, Portkey SDK defaults to https://api.portkey.ai/v1
+    # But the API key is typically configured for a custom gateway URL
+    # This mismatch causes 403 Forbidden errors
+    if not base_url or base_url.strip() == "":
+        error_msg = (
+            "Portkey base_url is empty! This causes the SDK to default to "
+            "https://api.portkey.ai/v1, which may not match your API key's gateway URL. "
+            "Please configure RAG_OPENAI_API_BASE_URL in Settings > Documents > Embedding, "
+            "or set the RAG_OPENAI_API_BASE_URL environment variable."
+        )
+        log.error(error_msg)
+        raise ValueError(error_msg)
+    
+    # Initialize Portkey client (simple - no deprecated virtual_key)
+    portkey = Portkey(
+        base_url=base_url,
+        api_key=api_key
+    )
+    
+    # Generate embeddings using SDK
+    # The SDK handles retries, rate limiting, and error handling automatically
     try:
-        import time
-        import requests
-
-        headers = {
-            "Content-Type": "application/json",
-            "x-portkey-api-key": key,
-            "x-portkey-virtual-key": virtual_key,
-        }
-
-        retry_count = 0
-        backoff_time = initial_backoff
         log.info(
-            f"Processing embeddings for {len(texts)} text chunks in a single batch"
+            f"Generating Portkey embeddings via SDK: "
+            f"model={model}, "
+            f"texts_count={len(texts) if isinstance(texts, list) else 1}, "
+            f"encoding_format={encoding_format}"
         )
-
-        while retry_count <= max_retries:
-            try:
-                r = requests.post(
-                    f"{url}/embeddings",
-                    headers=headers,
-                    json={"input": texts, "model": model, "encoding_format": "float"},
-                    timeout=60,  # To prevent hanging on large requests
-                )
-                r.raise_for_status()
-                data = r.json()
-
-                if "data" in data:
-                    return EmbeddingResult(
-                        embeddings=[elem["embedding"] for elem in data["data"]]
-                    )
-                else:
-                    return EmbeddingResult(
-                        error=ValueError("Response missing expected embedding data"),
-                        retriable=False,
-                    )
-
-            except requests.exceptions.HTTPError as e:
-                if (
-                    e.response.status_code == 429
-                    and retry_count < max_retries
-                    and backoff
-                ):
-                    # Rate limit hit, apply backoff
-                    log.warning(
-                        f"Rate limit hit, retrying in {backoff_time} seconds..."
-                    )
-                    time.sleep(backoff_time)
-                    # backoff_time *= 2  # Exponential backoff (Not using)
-                    retry_count += 1
-                elif e.response.status_code == 413:
-                    # Payload too large - cannot handle in a single batch
-                    log.warning("Request entity too large, need to batch smaller")
-                    return EmbeddingResult(
-                        error=ValueError("Payload too large for single batch"),
-                        retriable=True,
-                    )
-                else:
-                    # Other error or max retries reached
-                    log.exception(f"Error generating portkey batch embeddings: {e}")
-                    return EmbeddingResult(error=e, retriable=False)
-
-        # If we get here, we've exhausted all retries
-        return EmbeddingResult(
-            error=ValueError("Maximum retries exceeded for rate limiting"),
-            retriable=False,
+        
+        response = portkey.embeddings.create(
+            model=model,
+            input=texts,
+            encoding_format=encoding_format
         )
+        
+        # Extract embeddings from response
+        # Response.data is a list of EmbeddingData objects, ordered by index
+        embeddings = [item.embedding for item in response.data]
+        
+        # Validate embeddings were generated
+        if not embeddings:
+            raise ValueError("No embeddings returned from Portkey SDK")
+        
+        # Return single embedding for single string, list for batch
+        if isinstance(texts, str):
+            if len(embeddings) == 0:
+                raise ValueError("Expected at least one embedding for single text input")
+            return embeddings[0]
+        return embeddings
+        
     except Exception as e:
-        log.exception(f"Error generating portkey batch embeddings: {e}")
-        return EmbeddingResult(error=e, retriable=False)
+        error_msg = str(e)
+        # Provide more helpful error messages for common issues
+        if "403" in error_msg or "Forbidden" in error_msg:
+            log.error(
+                f"Portkey API returned 403 Forbidden. This usually means:\n"
+                f"1. The API key is not valid for the gateway URL ({base_url})\n"
+                f"2. The base_url ({base_url}) doesn't match the API key's configured gateway\n"
+                f"3. The API key doesn't have permission to use embeddings\n"
+                f"Please verify your API key and base_url in Settings > Documents > Embedding."
+            )
+        elif "401" in error_msg or "Unauthorized" in error_msg:
+            log.error(
+                f"Portkey API returned 401 Unauthorized. The API key may be invalid or expired. "
+                f"Please check your API key in Settings > Documents > Embedding."
+            )
+        log.exception(f"Error generating Portkey embeddings via SDK: {e}")
+        raise
 
 
 def generate_ollama_batch_embeddings(
@@ -744,9 +1007,54 @@ def generate_ollama_batch_embeddings(
 def generate_embeddings(
     engine: str, model: str, text: Union[str, list[str]], backoff: bool, **kwargs
 ):
+    """
+    Generate embeddings using the specified engine.
+    
+    This function routes embedding requests to the appropriate engine implementation.
+    For Portkey, it uses the official Python SDK for clean, maintainable code.
+    
+    Args:
+        engine: Embedding engine ("ollama", "openai", "portkey", or "" for local)
+        model: Model identifier (e.g., "@openai-embedding/text-embedding-3-small")
+        text: Single string or list of strings to embed
+        backoff: Whether to use exponential backoff (for legacy compatibility)
+        **kwargs: Additional engine-specific parameters:
+            - url: API base URL
+            - key: API key
+            - user: UserModel instance
+            
+    Returns:
+        list[float] if text is a single string
+        list[list[float]] if text is a list of strings
+    """
     url = kwargs.get("url", "")
     key = kwargs.get("key", "")
     user = kwargs.get("user")
+    
+    # CRITICAL FIX: For portkey/openai engines, dynamically retrieve the user's API key
+    # The `key` passed in may be the startup default (empty), but users configure their own keys
+    # This ensures per-user API key scoping works correctly for RAG queries
+    # RBAC: The key is retrieved based on user.email, which ensures:
+    # 1. User's own key (if set)
+    # 2. Group admin's key (if user is in a group created by an admin)
+    # 3. NOT accessible to other admins' keys (only their own group's admin)
+    if engine in ["openai", "portkey"] and user and hasattr(user, 'email') and user.email:
+        try:
+            from open_webui.config import RAG_OPENAI_API_KEY
+            user_key = RAG_OPENAI_API_KEY.get(user.email)
+            if user_key:
+                log.info(
+                    f"Using RBAC-scoped embedding API key for {user.email} "
+                    f"(key length: {len(user_key)}, accessible only to this user and their group admin's groups)"
+                )
+                key = user_key
+            else:
+                log.warning(
+                    f"No embedding API key found for user {user.email} - "
+                    f"check if user is in a group with an admin who has configured an API key"
+                )
+        except Exception as e:
+            log.warning(f"Failed to retrieve per-user API key: {e}")
 
     if engine == "ollama":
         if isinstance(text, list):
@@ -772,26 +1080,17 @@ def generate_embeddings(
 
         return embeddings[0] if isinstance(text, str) else embeddings
     elif engine == "portkey":
-        if isinstance(text, list):
-            embeddings = generate_portkey_batch_embeddings(
-                model, text, url, key, user, backoff
-            )
-        else:
-            embeddings = generate_portkey_batch_embeddings(
-                model, [text], url, key, user, backoff
-            )
+        # Use SDK-based implementation
+        embeddings = generate_portkey_embeddings_sdk(
+            model=model,
+            texts=text,
+            base_url=url,
+            api_key=key,
+            encoding_format="float"
+        )
+        return embeddings
     else:
         raise ValueError(f"Unknown embedding engine: {engine}")
-
-    # Handle the new EmbeddingResult object
-    if isinstance(embeddings, EmbeddingResult):
-        if embeddings.error:
-            raise embeddings.error
-        return (
-            embeddings.embeddings[0] if isinstance(text, str) else embeddings.embeddings
-        )
-
-    return embeddings[0] if isinstance(text, str) else embeddings
 
 
 import operator

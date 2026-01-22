@@ -16,9 +16,18 @@ import ast
 
 from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
+import atexit
 
 
 from fastapi import Request
+
+# Module-level ThreadPoolExecutor for RAG operations
+# This avoids creating a new thread pool for each request (expensive)
+# Max workers set to 10 to balance parallelism vs resource usage
+_RAG_EXECUTOR = ThreadPoolExecutor(max_workers=10, thread_name_prefix="rag_worker")
+
+# Ensure executor is properly cleaned up on shutdown
+atexit.register(_RAG_EXECUTOR.shutdown, wait=False)
 from fastapi import BackgroundTasks
 
 from starlette.responses import Response, StreamingResponse
@@ -36,6 +45,7 @@ from open_webui.routers.tasks import (
     generate_title,
     generate_image_prompt,
     generate_chat_tags,
+    find_gemini_flash_lite_model,
 )
 from open_webui.routers.retrieval import process_web_search, SearchForm
 from open_webui.routers.images import image_generations, GenerateImageForm
@@ -93,6 +103,8 @@ from open_webui.env import (
 from open_webui.constants import TASKS
 
 
+# Logging will be configured by start_logger() with NYC timezone
+# This is temporary - standard logging will be intercepted by Loguru
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
@@ -137,7 +149,7 @@ async def chat_completion_tools_handler(
     task_model_id = get_task_model_id(
         body["model"],
         request.app.state.config.TASK_MODEL,
-        request.app.state.config.TASK_MODEL_EXTERNAL,
+        request.app.state.config.TASK_MODEL_EXTERNAL.get(user.email),
         models,
     )
 
@@ -321,9 +333,9 @@ async def chat_web_search_handler(
         )
         return form_data
 
-    all_results = []
-
-    for searchQuery in queries:
+    # Parallelize web search queries for faster processing
+    async def process_single_search(searchQuery: str):
+        """Process a single search query and return results with the query for tracking"""
         await event_emitter(
             {
                 "type": "status",
@@ -346,31 +358,7 @@ async def chat_web_search_handler(
                 ),
                 user=user,
             )
-
-            if results:
-                all_results.append(results)
-                files = form_data.get("files", [])
-
-                if results.get("collection_name"):
-                    files.append(
-                        {
-                            "collection_name": results["collection_name"],
-                            "name": searchQuery,
-                            "type": "web_search",
-                            "urls": results["filenames"],
-                        }
-                    )
-                elif results.get("docs"):
-                    files.append(
-                        {
-                            "docs": results.get("docs", []),
-                            "name": searchQuery,
-                            "type": "web_search",
-                            "urls": results["filenames"],
-                        }
-                    )
-
-                form_data["files"] = files
+            return {"query": searchQuery, "results": results, "error": None}
         except Exception as e:
             log.exception(e)
             await event_emitter(
@@ -385,6 +373,48 @@ async def chat_web_search_handler(
                     },
                 }
             )
+            return {"query": searchQuery, "results": None, "error": str(e)}
+
+    # Process all queries in parallel
+    search_tasks = [process_single_search(query) for query in queries]
+    search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+    # Collect successful results and update form_data
+    all_results = []
+    files = form_data.get("files", [])
+
+    for search_result in search_results:
+        if isinstance(search_result, Exception):
+            log.exception(f"Exception in parallel search: {search_result}")
+            continue
+        
+        query = search_result.get("query")
+        results = search_result.get("results")
+        error = search_result.get("error")
+
+        if results and not error:
+            all_results.append(results)
+
+            if results.get("collection_name"):
+                files.append(
+                    {
+                        "collection_name": results["collection_name"],
+                        "name": query,
+                        "type": "web_search",
+                        "urls": results["filenames"],
+                    }
+                )
+            elif results.get("docs"):
+                files.append(
+                    {
+                        "docs": results.get("docs", []),
+                        "name": query,
+                        "type": "web_search",
+                        "urls": results["filenames"],
+                    }
+                )
+
+    form_data["files"] = files
 
     if all_results:
         urls = []
@@ -545,32 +575,35 @@ async def chat_completion_files_handler(
                 queries_response = {"queries": [queries_response]}
 
             queries = queries_response.get("queries", [])
-        except:
-            pass
+            log.debug(f"RAG query expansion generated {len(queries)} queries: {queries}")
+        except Exception as e:
+            # Query expansion failed - this is OK, we'll use the user's message as fallback
+            # This commonly happens when Gemini 2.5 Flash Lite is not available
+            log.debug(f"RAG query expansion failed (using user message as fallback): {e}")
 
         if len(queries) == 0:
             queries = [get_last_user_message(body["messages"])]
+            log.debug(f"Using user message as RAG query fallback: {queries}")
 
         try:
-            # Offload get_sources_from_files to a separate thread
+            # Offload get_sources_from_files to module-level thread pool (more efficient)
             loop = asyncio.get_running_loop()
-            with ThreadPoolExecutor() as executor:
-                sources = await loop.run_in_executor(
-                    executor,
-                    lambda: get_sources_from_files(
-                        request=request,
-                        files=files,
-                        queries=queries,
-                        embedding_function=lambda query: request.app.state.EMBEDDING_FUNCTION(
-                            query, user=user
-                        ),
-                        k=request.app.state.config.TOP_K.get(user.email),
-                        reranking_function=request.app.state.rf,
-                        r=request.app.state.config.RELEVANCE_THRESHOLD,
-                        hybrid_search=request.app.state.config.ENABLE_RAG_HYBRID_SEARCH.get(user.email),
-                        full_context=request.app.state.config.RAG_FULL_CONTEXT.get(user.email),
+            sources = await loop.run_in_executor(
+                _RAG_EXECUTOR,
+                lambda: get_sources_from_files(
+                    request=request,
+                    files=files,
+                    queries=queries,
+                    embedding_function=lambda query: request.app.state.EMBEDDING_FUNCTION(
+                        query, user=user
                     ),
-                )
+                    k=request.app.state.config.TOP_K.get(user.email),
+                    reranking_function=request.app.state.rf,
+                    r=request.app.state.config.RELEVANCE_THRESHOLD,
+                    hybrid_search=request.app.state.config.ENABLE_RAG_HYBRID_SEARCH.get(user.email),
+                    full_context=request.app.state.config.RAG_FULL_CONTEXT.get(user.email),
+                ),
+            )
         except Exception as e:
             log.exception(e)
 
@@ -648,7 +681,7 @@ async def process_chat_payload(request, form_data, metadata, user, model):
     task_model_id = get_task_model_id(
         form_data["model"],
         request.app.state.config.TASK_MODEL,
-        request.app.state.config.TASK_MODEL_EXTERNAL,
+        request.app.state.config.TASK_MODEL_EXTERNAL.get(user.email),
         models,
     )
 
@@ -798,7 +831,9 @@ async def process_chat_payload(request, form_data, metadata, user, model):
             sources.extend(flags.get("sources", []))
             s1 = f"{model}"
             log.info(f"Working within inbuilt RAG: {s1}")
-            log.info(f"Models: {models[task_model_id]}")
+            # Debug log for task model (may be None if user doesn't have access to Gemini Flash Lite)
+            if task_model_id and task_model_id in models:
+                log.debug(f"Task model: {models[task_model_id]}")
         except Exception as e:
             log.exception(e)
     else:
@@ -875,12 +910,23 @@ async def process_chat_response(
             messages = get_message_list(message_map, message.get("id"))
 
             if tasks and messages:
+                # Get available models and find Gemini Flash Lite before running tasks
+                from open_webui.utils.models import get_all_models
+                models_list = await get_all_models(request, user)
+                models = {model["id"]: model for model in models_list}
+                task_model_id = find_gemini_flash_lite_model(models)
+                
+                # If Gemini Flash Lite is not available, skip all background tasks
+                if not task_model_id:
+                    log.debug(f"Gemini Flash Lite not available for user {user.email}, skipping background tasks")
+                    return  # Exit early, don't run any tasks
+                
                 if TASKS.TITLE_GENERATION in tasks:
                     if tasks[TASKS.TITLE_GENERATION]:
                         res = await generate_title(
                             request,
                             {
-                                "model": message["model"],
+                                # Remove "model" key - task endpoint will find Gemini Flash Lite directly
                                 "messages": messages,
                                 "chat_id": metadata["chat_id"],
                             },
@@ -935,7 +981,7 @@ async def process_chat_response(
                     res = await generate_chat_tags(
                         request,
                         {
-                            "model": message["model"],
+                            # Remove "model" key - task endpoint will find Gemini Flash Lite directly
                             "messages": messages,
                             "chat_id": metadata["chat_id"],
                         },

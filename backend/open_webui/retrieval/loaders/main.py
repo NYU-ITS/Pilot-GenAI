@@ -1,3 +1,4 @@
+import os
 import requests
 import logging
 import ftfy
@@ -125,19 +126,59 @@ class Loader:
     def load(
         self, filename: str, file_content_type: str, file_path: str
     ) -> list[Document]:
-        loader = self._get_loader(filename, file_content_type, file_path)
-        docs = loader.load()
+        if not os.path.exists(file_path):
+            log.error(f"[LOADER] FAILED | file={filename} | reason=FILE_NOT_FOUND | path={file_path}")
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        file_size = os.path.getsize(file_path)
+        log.info(f"[LOADER] START | file={filename} | size={file_size}B | engine={self.engine}")
+        
+        try:
+            loader = self._get_loader(filename, file_content_type, file_path)
+            log.info(f"[LOADER] CREATED | type={type(loader).__name__}")
+            
+            docs = loader.load()
+            total_chars = sum(len(doc.page_content) for doc in docs) if docs else 0
+            non_empty = sum(1 for doc in docs if doc.page_content and doc.page_content.strip()) if docs else 0
+            
+            if len(docs) > 0:
+                log.info(f"[LOADER] SUCCESS | file={filename} | docs={len(docs)} | chars={total_chars} | non_empty={non_empty}")
+                if total_chars == 0:
+                    log.error(f"[LOADER] WARNING | file={filename} | all docs have empty page_content")
+            else:
+                log.error(f"[LOADER] FAILED | file={filename} | reason=NO_DOCS_RETURNED")
+        except Exception as e:
+            log.error(f"[LOADER] FAILED | file={filename} | error={type(e).__name__}: {str(e)}", exc_info=True)
+            raise
 
-        return [
+        result = [
             Document(
                 page_content=ftfy.fix_text(doc.page_content), metadata=doc.metadata
             )
             for doc in docs
         ]
+        log.info(f"[Loader.load] Returning {len(result)} processed document(s)")
+        return result
 
     def _get_loader(self, filename: str, file_content_type: str, file_path: str):
-        file_ext = filename.split(".")[-1].lower()
-
+        file_ext = filename.split(".")[-1].lower() if "." in filename else ""
+        
+        # FORCE PyPDF for PDFs (OpenShift requirement) - check PDF first before engine logic
+        if file_ext == "pdf":
+            extract_images = self.kwargs.get("PDF_EXTRACT_IMAGES", False)
+            log.info(f"[LOADER] PDF_DETECTED | file={filename} | loader=PyPDFLoader (forced) | extract_images={extract_images}")
+            if os.path.exists(file_path):
+                file_size = os.path.getsize(file_path)
+                log.info(f"[LOADER] PDF_INFO | file={filename} | size={file_size}B")
+            return PyPDFLoader(file_path, extract_images=extract_images)
+        
+        # Check if Document Intelligence is configured
+        use_doc_intel = (
+            self.kwargs.get("DOCUMENT_INTELLIGENCE_ENDPOINT") 
+            and self.kwargs.get("DOCUMENT_INTELLIGENCE_KEY")
+        )
+        
+        # For non-PDF files, use original engine logic (Tika/DocIntel available for other file types)
         if self.engine == "tika" and self.kwargs.get("TIKA_SERVER_URL"):
             if file_ext in known_source_ext or (
                 file_content_type and file_content_type.find("text/") >= 0
@@ -149,11 +190,7 @@ class Loader:
                     file_path=file_path,
                     mime_type=file_content_type,
                 )
-        elif (
-            self.engine == "document_intelligence"
-            and self.kwargs.get("DOCUMENT_INTELLIGENCE_ENDPOINT") != ""
-            and self.kwargs.get("DOCUMENT_INTELLIGENCE_KEY") != ""
-            and (
+        elif use_doc_intel and (
                 file_ext in ["pdf", "xls", "xlsx", "docx", "ppt", "pptx"]
                 or file_content_type
                 in [
@@ -163,7 +200,6 @@ class Loader:
                     "application/vnd.ms-powerpoint",
                     "application/vnd.openxmlformats-officedocument.presentationml.presentation",
                 ]
-            )
         ):
             loader = AzureAIDocumentIntelligenceLoader(
                 file_path=file_path,
@@ -171,11 +207,7 @@ class Loader:
                 api_key=self.kwargs.get("DOCUMENT_INTELLIGENCE_KEY"),
             )
         else:
-            if file_ext == "pdf":
-                loader = PyPDFLoader(
-                    file_path, extract_images=self.kwargs.get("PDF_EXTRACT_IMAGES")
-                )
-            elif file_ext == "csv":
+            if file_ext == "csv":
                 loader = CSVLoader(file_path)
             elif file_ext == "rst":
                 loader = UnstructuredRSTLoader(file_path, mode="elements")

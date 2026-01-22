@@ -303,8 +303,24 @@ class UserScopedConfig:
     #     return self.default
         
     def get(self, email: str) -> Any:
+        from open_webui.utils.cache import get_cache_manager
+        
+        cache = get_cache_manager()
+        
+        # Get user to check cache
+        user = Users.get_user_by_email(email)
+        if not user:
+            logging.debug(f"User {email} not found, using default for {self.config_path}")
+            return self.default
+        
+        # Step 1: Check cache for user settings
+        cached_value = cache.get_user_settings(user.id, self.config_path)
+        if cached_value is not None:
+            logging.debug(f"Cache hit for user {email} config {self.config_path}: {cached_value}")
+            return cached_value
+        
+        # Step 2: Check user-specific config in database
         with get_db() as db:
-            # Step 1: Check user-specific config
             entry = db.query(Config).filter_by(email=email).first()
             if entry and isinstance(entry.data, dict):
                 data = entry.data
@@ -317,19 +333,62 @@ class UserScopedConfig:
                         final_value = self.default
                         break
                 if final_value != self.default:
-                    print(f"User {email} has personal config for {self.config_path}: {final_value}")
-                return final_value
+                    logging.debug(f"User {email} has personal config for {self.config_path}: {final_value}")
+                    # Cache the result
+                    cache.set_user_settings(user.id, self.config_path, final_value)
+                    return final_value
 
-            # Step 2: Check group creator's config
-            user = Users.get_user_by_email(email)
-            print(f"User {email} maps to user_id={user.id}")
-            user_groups = Groups.get_groups_by_member_id(user.id)
-            print(f"User {email} is part of groups: {user_groups}")
+            # Step 3: Check group creator's config
+            logging.debug(f"User {email} maps to user_id={user.id}")
+            
+            # Check cache for user groups
+            cached_groups = cache.get_user_groups(user.id)
+            if cached_groups is not None:
+                # Reconstruct group objects from cached data
+                from open_webui.models.groups import GroupModel
+                user_groups = []
+                for g_data in cached_groups:
+                    # Create a minimal GroupModel-like object
+                    class CachedGroup:
+                        def __init__(self, group_id, created_by):
+                            self.id = group_id
+                            self.created_by = created_by
+                    user_groups.append(CachedGroup(g_data["id"], g_data["created_by"]))
+            else:
+                user_groups = Groups.get_groups_by_member_id(user.id)
+                # Cache the groups
+                groups_data = [{"id": g.id, "created_by": g.created_by} for g in user_groups]
+                cache.set_user_groups(user.id, groups_data)
+            
+            logging.debug(f"User {email} is part of groups: {[g.id for g in user_groups]}")
             
             for group in user_groups:
                 group_creator_email = group.created_by
-                print(f"Group created by {group_creator_email}")
+                logging.debug(f"Group {group.id} created by {group_creator_email}")
                 if group_creator_email:
+                    # RBAC: Check if this is an API key lookup - log for audit
+                    is_api_key_lookup = "api_key" in self.config_path or "openai_api_key" in self.config_path
+                    if is_api_key_lookup:
+                        logging.info(
+                            f"RBAC API Key Lookup: User {email} (ID: {user.id}) requesting API key. "
+                            f"Checking group {group.id} created by admin {group_creator_email}. "
+                            f"Key will only be accessible if user is in this admin's group."
+                        )
+                    
+                    # Check cache for group admin config
+                    cached_group_config = cache.get_group_admin_config(group.id, self.config_path)
+                    if cached_group_config is not None:
+                        logging.debug(f"Cache hit for group {group.id} admin config {self.config_path}: {cached_group_config}")
+                        if is_api_key_lookup:
+                            logging.info(
+                                f"RBAC API Key Access GRANTED: User {email} inheriting API key from "
+                                f"group admin {group_creator_email} (group {group.id})"
+                            )
+                        # Also cache for user
+                        cache.set_user_settings(user.id, self.config_path, cached_group_config)
+                        return cached_group_config
+                    
+                    # Query database for group admin config
                     creator_entry = db.query(Config).filter_by(email=group_creator_email).first()
                     if creator_entry and isinstance(creator_entry.data, dict):
                         data = creator_entry.data
@@ -342,14 +401,50 @@ class UserScopedConfig:
                                 final_value = self.default
                                 break
                         if final_value != self.default:
-                            print(f"Group admin {group_creator_email} has config for {self.config_path}: {final_value}")
-                        return final_value
+                            logging.debug(f"Group admin {group_creator_email} has config for {self.config_path}: {final_value}")
+                            if is_api_key_lookup:
+                                logging.info(
+                                    f"RBAC API Key Access GRANTED: User {email} inheriting API key from "
+                                    f"group admin {group_creator_email} (group {group.id}). "
+                                    f"This key is ONLY accessible to users in groups created by {group_creator_email}."
+                                )
+                            # Cache both group admin config and user settings
+                            cache.set_group_admin_config(group.id, self.config_path, final_value)
+                            cache.set_user_settings(user.id, self.config_path, final_value)
+                            return final_value
 
-            # Step 3: Fallback
-            print(f"Using default for {email} for {self.config_path}")
+            # Step 4: Fallback to default
+            logging.debug(f"Using default for {email} for {self.config_path}")
+            # Cache the default value to avoid repeated DB queries
+            cache.set_user_settings(user.id, self.config_path, self.default)
             return self.default
 
     def set(self, email: str, value: Any):
+        """
+        Set a user-scoped configuration value.
+        
+        RBAC Note: For API keys (rag.openai_api_key), this stores the key under the admin's email.
+        The key will be accessible to:
+        1. The admin themselves (when they use their own email to lookup)
+        2. Users in groups created by this admin (via group inheritance)
+        3. NOT accessible to other admins or users in other admins' groups
+        
+        This ensures proper RBAC isolation between different admins and their groups.
+        """
+        from open_webui.utils.cache import get_cache_manager
+        
+        cache = get_cache_manager()
+        
+        # RBAC: Log API key configuration for audit
+        is_api_key = "api_key" in self.config_path or "openai_api_key" in self.config_path
+        if is_api_key:
+            logging.info(
+                f"RBAC API Key Configuration: Admin {email} setting API key for {self.config_path}. "
+                f"This key will be accessible ONLY to: (1) Admin {email}, "
+                f"(2) Users in groups created by {email}. "
+                f"Other admins and their groups will NOT have access."
+            )
+        
         with get_db() as db:
             entry = db.query(Config).filter_by(email=email).first()
             if not entry:
@@ -369,6 +464,25 @@ class UserScopedConfig:
             entry.updated_at = datetime.now()
             flag_modified(entry, "data")  
             db.commit()
+        
+        # Invalidate cache for this user's settings
+        user = Users.get_user_by_email(email)
+        if user:
+            cache.invalidate_user_settings(user.id, self.config_path)
+            
+            # Also invalidate cache for all users who inherit from this user (as group admin)
+            # Get all groups created by this user
+            groups = Groups.get_groups(email)
+            if is_api_key:
+                logging.info(
+                    f"RBAC Cache Invalidation: Invalidating API key cache for admin {email} "
+                    f"and their {len(groups)} group(s) to ensure fresh RBAC enforcement"
+                )
+            for group in groups:
+                # Invalidate group admin config cache
+                cache.invalidate_group_admin_config(group.id, self.config_path)
+                # Invalidate cache for all members of this group
+                cache.invalidate_group_member_users(group.id)
 
 
 
@@ -445,6 +559,16 @@ API_KEY_ALLOWED_ENDPOINTS = PersistentConfig(
 
 JWT_EXPIRES_IN = PersistentConfig(
     "JWT_EXPIRES_IN", "auth.jwt_expiry", os.environ.get("JWT_EXPIRES_IN", "-1")
+)
+
+####################################
+# Pilot GenAI Terms & Conditions
+####################################
+
+PILOT_GENAI_TERMS_VERSION = PersistentConfig(
+    "PILOT_GENAI_TERMS_VERSION",
+    "pilot_genai.terms.version",
+    int(os.environ.get("PILOT_GENAI_TERMS_VERSION", "1")),
 )
 
 ####################################
@@ -1324,8 +1448,8 @@ TASK_MODEL = PersistentConfig(
     os.environ.get("TASK_MODEL", ""),
 )
 
-TASK_MODEL_EXTERNAL = PersistentConfig(
-    "TASK_MODEL_EXTERNAL",
+# TASK_MODEL_EXTERNAL is now per-admin - auto-set to Gemini 2.5 Flash Lite if user has access
+TASK_MODEL_EXTERNAL = UserScopedConfig(
     "task.model.external",
     os.environ.get("TASK_MODEL_EXTERNAL", ""),
 )
@@ -1407,29 +1531,25 @@ Strictly return in JSON format:
 {{MESSAGES:END:6}}
 </chat_history>"""
 
-ENABLE_TAGS_GENERATION = PersistentConfig(
-    "ENABLE_TAGS_GENERATION",
+# Task feature flags are now per-admin, default to False (disabled)
+ENABLE_TAGS_GENERATION = UserScopedConfig(
     "task.tags.enable",
     os.environ.get("ENABLE_TAGS_GENERATION", "False").lower() == "true",
 )
 
-ENABLE_TITLE_GENERATION = PersistentConfig(
-    "ENABLE_TITLE_GENERATION",
+ENABLE_TITLE_GENERATION = UserScopedConfig(
     "task.title.enable",
     os.environ.get("ENABLE_TITLE_GENERATION", "False").lower() == "true",
 )
 
-
-ENABLE_SEARCH_QUERY_GENERATION = PersistentConfig(
-    "ENABLE_SEARCH_QUERY_GENERATION",
+ENABLE_SEARCH_QUERY_GENERATION = UserScopedConfig(
     "task.query.search.enable",
-    os.environ.get("ENABLE_SEARCH_QUERY_GENERATION", "True").lower() == "true",
+    os.environ.get("ENABLE_SEARCH_QUERY_GENERATION", "False").lower() == "true",
 )
 
-ENABLE_RETRIEVAL_QUERY_GENERATION = PersistentConfig(
-    "ENABLE_RETRIEVAL_QUERY_GENERATION",
+ENABLE_RETRIEVAL_QUERY_GENERATION = UserScopedConfig(
     "task.query.retrieval.enable",
-    os.environ.get("ENABLE_RETRIEVAL_QUERY_GENERATION", "True").lower() == "true",
+    os.environ.get("ENABLE_RETRIEVAL_QUERY_GENERATION", "False").lower() == "true",
 )
 
 
@@ -1463,8 +1583,8 @@ Strictly return in JSON format:
 </chat_history>
 """
 
-ENABLE_AUTOCOMPLETE_GENERATION = PersistentConfig(
-    "ENABLE_AUTOCOMPLETE_GENERATION",
+# Autocomplete generation is now per-admin, default to False (disabled)
+ENABLE_AUTOCOMPLETE_GENERATION = UserScopedConfig(
     "task.autocomplete.enable",
     os.environ.get("ENABLE_AUTOCOMPLETE_GENERATION", "False").lower() == "true",
 )
@@ -1815,7 +1935,7 @@ BYPASS_EMBEDDING_AND_RETRIEVAL = PersistentConfig(
     "rag.bypass_embedding_and_retrieval",
     os.environ.get("BYPASS_EMBEDDING_AND_RETRIEVAL", "False").lower() == "true",
 )
-RAG_TOP_K = UserScopedConfig( "rag.top_k", int(os.environ.get("RAG_TOP_K", "4")))
+RAG_TOP_K = UserScopedConfig( "rag.top_k", int(os.environ.get("RAG_TOP_K", "10")))
 
 # RAG_TOP_K = PersistentConfig(
 #     "RAG_TOP_K", "rag.top_k", int(os.environ.get("RAG_TOP_K", "3"))
@@ -1883,7 +2003,7 @@ PDF_EXTRACT_IMAGES = PersistentConfig(
 RAG_EMBEDDING_MODEL = PersistentConfig(
     "RAG_EMBEDDING_MODEL",
     "rag.embedding_model",
-    os.environ.get("RAG_EMBEDDING_MODEL", "text-embedding-d47871"),
+    os.environ.get("RAG_EMBEDDING_MODEL", "@openai-embedding/text-embedding-3-small"),
 )
 log.info(f"Embedding model set: {RAG_EMBEDDING_MODEL.value}")
 
@@ -1904,6 +2024,13 @@ RAG_EMBEDDING_BATCH_SIZE = PersistentConfig(
         or os.environ.get("RAG_EMBEDDING_OPENAI_BATCH_SIZE", "1")
     ),
 )
+
+# Portkey virtual key - user-specific, inherits from group admin if user is member
+# For admins: uses their own virtual key from config
+# For group members: inherits virtual key from their group's admin
+# Default: from RAG_EMBEDDING_MODEL if it's a virtual key (doesn't start with "@")
+# NOTE: RAG_EMBEDDING_PORTKEY_VIRTUAL_KEY has been removed (deprecated)
+# Portkey no longer uses virtual_key - only api_key is needed
 
 RAG_RERANKING_MODEL = PersistentConfig(
     "RAG_RERANKING_MODEL",
@@ -1999,10 +2126,12 @@ RAG_OPENAI_API_BASE_URL = PersistentConfig(
     "rag.openai_api_base_url",
     os.getenv("RAG_OPENAI_API_BASE_URL", "https://ai-gateway.apps.cloud.rt.nyu.edu/v1"),
 )
-RAG_OPENAI_API_KEY = PersistentConfig(
-    "RAG_OPENAI_API_KEY",
+# Per-admin embedding API key
+# Each admin sets their own key that applies to them and their user group
+# No hardcoded default - admins must configure their own key
+RAG_OPENAI_API_KEY = UserScopedConfig(
     "rag.openai_api_key",
-    os.getenv("RAG_OPENAI_API_KEY", "dogDlg+W3/1qn7LsU3oTuJHDEopS"),
+    os.getenv("RAG_OPENAI_API_KEY", ""),  # Empty default - must be configured by admin
 )
 
 RAG_OLLAMA_BASE_URL = PersistentConfig(
