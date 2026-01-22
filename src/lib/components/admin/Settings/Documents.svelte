@@ -4,10 +4,22 @@
 	import { onMount, getContext, createEventDispatcher } from 'svelte';
 
 	import { user } from '$lib/stores';
+	import { getSuperAdminEmails } from '$lib/apis/users';
 
-	const SPECIAL_ADMIN_EMAILS = ['cg4532@nyu.edu','ms15138@nyu.edu','mb484@nyu.edu','sm11538@nyu.edu','ht2490@nyu.edu','ps5226@nyu.edu'];
+	let superAdminEmails: string[] = [];
+	let canViewFileSettings = false;
 
-	const canViewFileSettings = () => SPECIAL_ADMIN_EMAILS.includes($user?.email);
+	const checkCanViewFileSettings = () => {
+		if (!$user?.email) {
+			canViewFileSettings = false;
+			return;
+		}
+		canViewFileSettings = superAdminEmails.some(email => email.toLowerCase() === $user.email.toLowerCase());
+	};
+
+	$: if ($user?.email && superAdminEmails.length > 0) {
+		checkCanViewFileSettings();
+	}
 
 	const dispatch = createEventDispatcher();
 
@@ -45,7 +57,7 @@
 	let showResetUploadDirConfirm = false;
 
 	let embeddingEngine = 'portkey';
-	let embeddingModel = 'text-embedding-d47871';
+	let embeddingModel = '@openai-embedding/text-embedding-3-small';
 	let embeddingBatchSize = 1;
 	let rerankingModel = '';
 
@@ -74,7 +86,7 @@
 	let OpenAIKey = '';
 
 	let PortkeyUrl = 'https://ai-gateway.apps.cloud.rt.nyu.edu/v1';
-	let PortkeyKey = 'dogDlg+W3/1qn7LsU3oTuJHDEopS';
+	let PortkeyKey = '';  // Admin must provide API key - no default
 
 	let OllamaUrl = '';
 	let OllamaKey = '';
@@ -87,39 +99,22 @@
 	};
 
 	const embeddingModelUpdateHandler = async () => {
-		if (embeddingEngine === '' && embeddingModel.split('/').length - 1 > 1) {
-			toast.error(
-				$i18n.t(
-					'Model filesystem path detected. Model shortname is required for update, cannot continue.'
-				)
-			);
-			return;
+		// Portkey is the only supported embedding engine - enforce it
+		if (embeddingEngine !== 'portkey') {
+			embeddingEngine = 'portkey';
+			if (!embeddingModel || embeddingModel === '') {
+				embeddingModel = '@openai-embedding/text-embedding-3-small';
+			}
 		}
-		if (embeddingEngine === 'ollama' && embeddingModel === '') {
-			toast.error(
-				$i18n.t(
-					'Model filesystem path detected. Model shortname is required for update, cannot continue.'
-				)
-			);
-			return;
-		}
-
-		if (embeddingEngine === 'openai' && embeddingModel === '') {
-			toast.error(
-				$i18n.t(
-					'Model filesystem path detected. Model shortname is required for update, cannot continue.'
-				)
-			);
-			return;
-		}
-
-		if (embeddingEngine === 'openai' && (OpenAIKey === '' || OpenAIUrl === '')) {
-			toast.error($i18n.t('OpenAI URL/Key required.'));
-			return;
-		}
+		
 		if (embeddingEngine === 'portkey' && (PortkeyKey === '' || PortkeyUrl === '')) {
-			toast.error($i18n.t('PORTKEY URL/Key required.'));
+			toast.error($i18n.t('Portkey URL/Key required.'));
 			return;
+		}
+		
+		// Ensure model is set to default if empty
+		if (!embeddingModel || embeddingModel === '') {
+			embeddingModel = '@openai-embedding/text-embedding-3-small';
 		}
 
 		console.log('Update embedding model attempt:', embeddingModel);
@@ -127,7 +122,7 @@
 		updateEmbeddingModelLoading = true;
 		const res = await updateEmbeddingConfig(localStorage.token, {
 			email: $user.email,
-			embedding_engine: embeddingEngine,
+			embedding_engine: 'portkey', // Always use Portkey
 			embedding_model: embeddingModel,
 			embedding_batch_size: embeddingBatchSize,
 			ollama_config: {
@@ -135,8 +130,8 @@
 				url: OllamaUrl
 			},
 			openai_config: {
-				key: embeddingEngine === 'portkey' ? PortkeyKey : OpenAIKey,
-				url: embeddingEngine === 'portkey' ? PortkeyUrl : OpenAIUrl
+				key: PortkeyKey,
+				url: PortkeyUrl
 			}
 		}).catch(async (error) => {
 			toast.error(`${error}`);
@@ -251,7 +246,7 @@
 			embeddingEngine = embeddingConfig.embedding_engine || 'portkey';
 			if (!embeddingConfig.embedding_model) {
 				if (embeddingConfig.embedding_engine === 'portkey') {
-					embeddingModel = 'text-embedding-d47871'; 
+					embeddingModel = '@openai-embedding/text-embedding-3-small'; 
 				} else if (embeddingConfig.embedding_engine === '') {
 					embeddingModel = 'sentence-transformers/all-MiniLM-L6-v2';
 				} else {
@@ -266,12 +261,11 @@
 			// embeddingModel = embeddingConfig.embedding_model;
 			embeddingBatchSize = embeddingConfig.embedding_batch_size ?? 1;
 
-			if (embeddingConfig.embedding_engine === 'portkey') {
+			// Portkey is the only supported embedding engine
+			if (embeddingConfig.embedding_engine === 'portkey' || embeddingConfig.embedding_engine === 'openai') {
+				// Handle both 'portkey' and legacy 'openai' configs for Portkey
 				PortkeyKey = embeddingConfig.openai_config?.key || PortkeyKey;
 				PortkeyUrl = embeddingConfig.openai_config?.url || PortkeyUrl;
-			} else if (embeddingConfig.embedding_engine === 'openai') {
-				OpenAIKey = embeddingConfig.openai_config?.key || OpenAIKey;
-				OpenAIUrl = embeddingConfig.openai_config?.url || OpenAIUrl;
 			}
 
 
@@ -279,7 +273,7 @@
 			OllamaUrl = embeddingConfig.ollama_config.url;
 		} else {
 		embeddingEngine = 'portkey';
-		embeddingModel = 'text-embedding-d47871';
+		embeddingModel = '@openai-embedding/text-embedding-3-small';
 		}
 	};
 
@@ -296,6 +290,16 @@
 	};
 
 	onMount(async () => {
+		// Fetch super admin emails from API
+		try {
+			if (localStorage.token) {
+				superAdminEmails = await getSuperAdminEmails(localStorage.token);
+				checkCanViewFileSettings();
+			}
+		} catch (error) {
+			console.error('Error fetching super admin emails:', error);
+		}
+
 		await setEmbeddingConfig();
 		await setRerankingConfig();
 
@@ -513,59 +517,26 @@
 									bind:value={embeddingEngine}
 									aria-label="Select an embedding model engine"
 									placeholder="Select an embedding model engine"
+									disabled={true}
 									on:change={(e) => {
-										if (e.target.value === 'ollama') {
-											embeddingModel = '';
-										} else if (e.target.value === 'openai') {
-											embeddingModel = 'text-embedding-3-small';
-										} else if (e.target.value === 'portkey') {
-											embeddingModel = 'text-embedding-d47871'
-										} else if (e.target.value === '') {
-											embeddingModel = 'sentence-transformers/all-MiniLM-L6-v2';
-										}
+										// Portkey is the only supported embedding engine
+										embeddingEngine = 'portkey';
+										embeddingModel = '@openai-embedding/text-embedding-3-small';
 									}}
 								>
-									<!-- <option value="">{$i18n.t('Default (SentenceTransformers)')}</option>
-									<option value="ollama">{$i18n.t('Ollama')}</option>
-									<option value="openai">{$i18n.t('OpenAI')}</option> -->
-									<option value="portkey">{$i18n.t('Portkey')}</option>
+									<option value="portkey">{$i18n.t('Portkey')} (Default)</option>
 								</select>
 							</div>
 						</div>
 
-						{#if embeddingEngine === 'openai'}
-							<div class="my-0.5 flex gap-2 pr-2">
-								<input
-									class="flex-1 w-full rounded-lg text-sm bg-transparent outline-hidden"
-									placeholder={$i18n.t('API Base URL')}
-									bind:value={OpenAIUrl}
-									required
-								/>
-
-								<SensitiveInput placeholder={$i18n.t('API Key')} bind:value={OpenAIKey} />
-							</div>
-						{:else if embeddingEngine === 'ollama'}
-							<div class="my-0.5 flex gap-2 pr-2">
-								<input
-									class="flex-1 w-full rounded-lg text-sm bg-transparent outline-hidden"
-									placeholder={$i18n.t('API Base URL')}
-									bind:value={OllamaUrl}
-									required
-								/>
-
-								<SensitiveInput
-									placeholder={$i18n.t('API Key')}
-									bind:value={OllamaKey}
-									required={false}
-								/>
-							</div>
-						{:else if embeddingEngine === 'portkey'}
+						{#if embeddingEngine === 'portkey'}
 							<div class="my-0.5 flex gap-2 pr-2">
 								<input
 									class="flex-1 w-full rounded-lg text-sm bg-transparent outline-hidden"
 									placeholder={$i18n.t('API Base URL')}
 									bind:value={PortkeyUrl}
 									required
+									readonly={true}
 								/>
 								<SensitiveInput placeholder={$i18n.t('API Key')} bind:value={PortkeyKey} />
 							</div>
@@ -666,7 +637,7 @@
 						</div>
 					</div>
 
-					{#if embeddingEngine === 'ollama' || embeddingEngine === 'openai' || embeddingEngine == 'portkey'}
+					{#if embeddingEngine === 'portkey'}
 						<div class="  mb-2.5 flex w-full justify-between">
 							<div class=" self-center text-xs font-medium">{$i18n.t('Embedding Batch Size')}</div>
 
@@ -846,7 +817,7 @@
 				</div>
 			{/if}
 
-			{#if canViewFileSettings()}
+			{#if canViewFileSettings}
 				<div class="mb-3">
 					<div class=" mb-2.5 text-base font-medium">{$i18n.t('Files')}</div>
 
