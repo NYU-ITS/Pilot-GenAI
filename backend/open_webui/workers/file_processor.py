@@ -53,6 +53,7 @@ from open_webui.config import (
     # Import all RAG config objects needed by worker
     RAG_EMBEDDING_ENGINE,
     RAG_EMBEDDING_MODEL,
+    RAG_EMBEDDING_MODEL_USER,  # RBAC: Per-admin model name
     RAG_EMBEDDING_BATCH_SIZE,
     RAG_RERANKING_MODEL,
     RAG_OPENAI_API_BASE_URL,
@@ -67,6 +68,12 @@ from open_webui.config import (
     DOCUMENT_INTELLIGENCE_ENDPOINT,
     DOCUMENT_INTELLIGENCE_KEY,
     BYPASS_EMBEDDING_AND_RETRIEVAL,
+    # Additional UserScopedConfig objects used in worker code paths
+    RAG_TEMPLATE,  # Used in _get_user_chunk_settings
+    RAG_TOP_K,  # Used in retrieval queries (aliased as TOP_K)
+    ENABLE_RAG_HYBRID_SEARCH,  # Used in retrieval queries
+    RAG_FULL_CONTEXT,  # Used in config endpoints
+    RAG_RELEVANCE_THRESHOLD,  # PersistentConfig, used in retrieval
 )
 from open_webui.retrieval.utils import get_embedding_function
 
@@ -172,6 +179,7 @@ def get_worker_config():
             # Assign all RAG config values to AppConfig (same as main.py)
             _worker_config.RAG_EMBEDDING_ENGINE = RAG_EMBEDDING_ENGINE
             _worker_config.RAG_EMBEDDING_MODEL = RAG_EMBEDDING_MODEL
+            _worker_config.RAG_EMBEDDING_MODEL_USER = RAG_EMBEDDING_MODEL_USER  # RBAC: Per-admin model name
             _worker_config.RAG_EMBEDDING_BATCH_SIZE = RAG_EMBEDDING_BATCH_SIZE
             _worker_config.RAG_RERANKING_MODEL = RAG_RERANKING_MODEL
             _worker_config.RAG_OPENAI_API_BASE_URL = RAG_OPENAI_API_BASE_URL
@@ -182,6 +190,16 @@ def get_worker_config():
             _worker_config.TEXT_SPLITTER = RAG_TEXT_SPLITTER
             _worker_config.CHUNK_SIZE = CHUNK_SIZE  # UserScopedConfig
             _worker_config.CHUNK_OVERLAP = CHUNK_OVERLAP  # UserScopedConfig
+            # Additional UserScopedConfig objects used in worker code paths
+            _worker_config.RAG_TEMPLATE = RAG_TEMPLATE  # Used in _get_user_chunk_settings
+            _worker_config.TOP_K = RAG_TOP_K  # Used in retrieval queries (aliased as TOP_K in main.py)
+            _worker_config.RAG_TOP_K = RAG_TOP_K  # Also set alias for compatibility
+            _worker_config.ENABLE_RAG_HYBRID_SEARCH = ENABLE_RAG_HYBRID_SEARCH  # Used in retrieval queries
+            _worker_config.RAG_FULL_CONTEXT = RAG_FULL_CONTEXT  # Used in config endpoints
+            _worker_config.RELEVANCE_THRESHOLD = RAG_RELEVANCE_THRESHOLD  # PersistentConfig, used in retrieval
+            # CRITICAL: Force PDF_EXTRACT_IMAGES to False to prevent hangs (image extraction causes 2+ minute slowdowns)
+            # First assign the PersistentConfig object (like main.py does), then override its value
+            PDF_EXTRACT_IMAGES.value = False
             _worker_config.PDF_EXTRACT_IMAGES = PDF_EXTRACT_IMAGES
             _worker_config.DOCUMENT_INTELLIGENCE_ENDPOINT = DOCUMENT_INTELLIGENCE_ENDPOINT
             _worker_config.DOCUMENT_INTELLIGENCE_KEY = DOCUMENT_INTELLIGENCE_KEY
@@ -279,13 +297,14 @@ class MockState:
         # EMBEDDING_FUNCTION will be initialized per-job with the correct per-user API key
         self.EMBEDDING_FUNCTION = None
     
-    def initialize_embedding_function(self, embedding_api_key: Optional[str] = None):
+    def initialize_embedding_function(self, embedding_api_key: Optional[str] = None, embedding_model: Optional[str] = None):
         """
-        Initialize EMBEDDING_FUNCTION with the correct per-user/per-admin API key.
-        This is called per-job to ensure RBAC-protected API keys are used.
+        Initialize EMBEDDING_FUNCTION with the correct per-user/per-admin API key and model.
+        This is called per-job to ensure RBAC-protected API keys and models are used.
         
         Args:
             embedding_api_key: Per-user/per-admin API key from job (RBAC-protected)
+            embedding_model: Per-user/per-admin model name from job (RBAC-protected)
         """
         # Use the passed API key (from job) or the one stored during initialization
         api_key = embedding_api_key or self._embedding_api_key
@@ -330,9 +349,23 @@ class MockState:
                     log.error(error_msg)
                     raise ValueError(error_msg)
             
+            # CRITICAL RBAC: Use embedding_model from job parameter, not config
+            # Config may have fallback/env var values that break RBAC
+            model_to_use = embedding_model if embedding_model else self.config.RAG_EMBEDDING_MODEL
+            if not model_to_use or not model_to_use.strip():
+                error_msg = (
+                    "No embedding model provided! "
+                    "Embedding will fail. This model should come from admin config (RBAC-protected). "
+                    "Please ensure the admin has configured a model in Settings > Documents > Embedding."
+                )
+                log.error(error_msg)
+                raise ValueError(error_msg)
+            
+            log.info(f"[RBAC] Using embedding model from job: {model_to_use} (RBAC-protected)")
+            
             self.EMBEDDING_FUNCTION = get_embedding_function(
                 self.config.RAG_EMBEDDING_ENGINE,
-                self.config.RAG_EMBEDDING_MODEL,
+                model_to_use,  # Use job parameter, not config (RBAC-protected)
                 self.ef,  # Can be None for API-based engines
                 api_url,
                 api_key,
@@ -351,42 +384,86 @@ class MockState:
             raise  # Re-raise to fail fast
 
 
+# Mock UserScopedConfig class for fallback config compatibility
+# Must be defined before _FallbackConfig uses it
+class MockUserScopedConfig:
+    """
+    Mock UserScopedConfig for compatibility when AppConfig fails.
+    Provides .get() and .set() methods that return/accept values but don't persist them.
+    """
+    def __init__(self, default_value):
+        self.default = default_value
+    
+    def get(self, email: str = None):
+        """
+        Mock get() method for compatibility with UserScopedConfig.get().
+        In workers, we don't have user-specific configs, so always return the default value.
+        """
+        return self.default
+    
+    def set(self, email: str, value):
+        """
+        Mock set() method for compatibility with UserScopedConfig.set().
+        In workers, we don't persist user-specific configs, so this is a no-op.
+        """
+        # No-op: workers don't persist configs, they use job parameters
+        pass
+
+
 class _FallbackConfig:
     """
     Fallback configuration object used when AppConfig initialization fails.
     Provides minimal required attributes with safe defaults.
+    
+    NOTE: This should rarely be used. If AppConfig fails, it's usually a critical error.
+    Model names and API keys come from job parameters (RBAC-protected), not from env vars.
     """
     def __init__(self):
         # Set minimal required attributes with safe defaults from environment
+        # NOTE: RAG_EMBEDDING_MODEL should NOT be used - jobs pass embedding_model parameter (RBAC-protected)
         self.RAG_EMBEDDING_ENGINE = os.environ.get("RAG_EMBEDDING_ENGINE", "portkey")
+        # WARNING: This is a fallback only - actual model comes from job parameter (embedding_model)
+        # Do NOT use this for embeddings - it breaks RBAC!
         self.RAG_EMBEDDING_MODEL = os.environ.get("RAG_EMBEDDING_MODEL", "@openai-embedding/text-embedding-3-small")
+        # RAG_EMBEDDING_MODEL_USER is a UserScopedConfig - create mock for compatibility
+        # NOTE: This should NOT be used - jobs pass embedding_model parameter (RBAC-protected)
+        self.RAG_EMBEDDING_MODEL_USER = MockUserScopedConfig(os.environ.get("RAG_EMBEDDING_MODEL", "@openai-embedding/text-embedding-3-small"))
         self.RAG_EMBEDDING_BATCH_SIZE = int(os.environ.get("RAG_EMBEDDING_BATCH_SIZE", "1"))
         self.RAG_RERANKING_MODEL = os.environ.get("RAG_RERANKING_MODEL", "")
         self.RAG_OPENAI_API_BASE_URL = os.environ.get("RAG_OPENAI_API_BASE_URL", "")
-        # For UserScopedConfig, create a mock object with .default property
-        class MockUserScopedConfig:
-            def __init__(self, default_value):
-                self.default = default_value
+        # UserScopedConfig objects - use MockUserScopedConfig for compatibility
         self.RAG_OPENAI_API_KEY = MockUserScopedConfig(os.environ.get("RAG_OPENAI_API_KEY", ""))
         self.RAG_OLLAMA_BASE_URL = os.environ.get("RAG_OLLAMA_BASE_URL", "")
         self.RAG_OLLAMA_API_KEY = os.environ.get("RAG_OLLAMA_API_KEY", "")
         self.CONTENT_EXTRACTION_ENGINE = os.environ.get("CONTENT_EXTRACTION_ENGINE", "auto")
         self.TIKA_SERVER_URL = os.environ.get("TIKA_SERVER_URL", "")
-        self.PDF_EXTRACT_IMAGES = os.environ.get("PDF_EXTRACT_IMAGES", "False").lower() == "true"
+        # CRITICAL: Force extract_images=False to prevent hangs (image extraction causes 2+ minute slowdowns)
+        self.PDF_EXTRACT_IMAGES = False
         self.TEXT_SPLITTER = os.environ.get("RAG_TEXT_SPLITTER", "recursive")
-        # UserScopedConfig - use .default for fallback
+        # UserScopedConfig objects - use MockUserScopedConfig for compatibility
+        # These are used in save_docs_to_vector_db and other worker code paths
         self.CHUNK_SIZE = MockUserScopedConfig(int(os.environ.get("CHUNK_SIZE", "1000")))
-        self.CHUNK_OVERLAP = MockUserScopedConfig(int(os.environ.get("CHUNK_OVERLAP", "100")))
+        self.CHUNK_OVERLAP = MockUserScopedConfig(int(os.environ.get("CHUNK_OVERLAP", "200")))
+        # RAG_TEMPLATE is used in _get_user_chunk_settings (called from save_docs_to_vector_db)
+        from open_webui.config import DEFAULT_RAG_TEMPLATE
+        self.RAG_TEMPLATE = MockUserScopedConfig(os.environ.get("RAG_TEMPLATE", DEFAULT_RAG_TEMPLATE))
+        # TOP_K is used in retrieval queries (aliased as RAG_TOP_K in config.py)
+        self.TOP_K = MockUserScopedConfig(int(os.environ.get("RAG_TOP_K", "10")))
+        self.RAG_TOP_K = self.TOP_K  # Alias for compatibility
+        # ENABLE_RAG_HYBRID_SEARCH is used in retrieval queries
+        self.ENABLE_RAG_HYBRID_SEARCH = MockUserScopedConfig(os.environ.get("ENABLE_RAG_HYBRID_SEARCH", "False").lower() == "true")
+        # RAG_FULL_CONTEXT is used in config endpoints
+        self.RAG_FULL_CONTEXT = MockUserScopedConfig(os.environ.get("RAG_FULL_CONTEXT", "False").lower() == "true")
+        # RELEVANCE_THRESHOLD is a PersistentConfig, not UserScopedConfig
+        self.RELEVANCE_THRESHOLD = float(os.environ.get("RAG_RELEVANCE_THRESHOLD", "1"))
+        
+        # Other non-UserScopedConfig attributes
         self.DOCUMENT_INTELLIGENCE_ENDPOINT = os.environ.get("DOCUMENT_INTELLIGENCE_ENDPOINT", "")
         self.DOCUMENT_INTELLIGENCE_KEY = os.environ.get("DOCUMENT_INTELLIGENCE_KEY", "")
         self.BYPASS_EMBEDDING_AND_RETRIEVAL = os.environ.get("BYPASS_EMBEDDING_AND_RETRIEVAL", "False").lower() == "true"
         # Add TIKA_SERVER_URL for fallback (even though we don't use it, it might be accessed)
         self.TIKA_SERVER_URL = os.environ.get("TIKA_SERVER_URL", "")
-        # Add missing config attributes that might be accessed
-        self.RAG_EMBEDDING_ENGINE = os.environ.get("RAG_EMBEDDING_ENGINE", "portkey")
-        self.RAG_EMBEDDING_MODEL = os.environ.get("RAG_EMBEDDING_MODEL", "@openai-embedding/text-embedding-3-small")
-        self.RAG_EMBEDDING_BATCH_SIZE = int(os.environ.get("RAG_EMBEDDING_BATCH_SIZE", "1"))
-        self.RAG_OPENAI_API_BASE_URL = os.environ.get("RAG_OPENAI_API_BASE_URL", "")
+        # Add missing config attributes that might be accessed (duplicates removed)
         self.RAG_OLLAMA_BASE_URL = os.environ.get("RAG_OLLAMA_BASE_URL", "")
         self.RAG_OLLAMA_API_KEY = os.environ.get("RAG_OLLAMA_API_KEY", "")
     
@@ -411,6 +488,8 @@ def process_file_job(
     collection_name: Optional[str] = None,
     knowledge_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    owner_email: Optional[str] = None,
+    embedding_model: Optional[str] = None,
     embedding_api_key: Optional[str] = None,
     _otel_trace_context: Optional[dict] = None,
 ) -> dict:
@@ -423,6 +502,8 @@ def process_file_job(
         collection_name: Optional collection name for embeddings
         knowledge_id: Optional knowledge base ID
         user_id: User ID who initiated the processing
+        owner_email: Email of the admin who owns the KB/file (for RBAC - per-admin model/key lookup)
+        embedding_model: Per-admin embedding model name (resolved at enqueue time for RBAC)
         embedding_api_key: API key for embedding service (per-user, from admin config)
         _otel_trace_context: Optional trace context for distributed tracing (internal use)
         
@@ -437,11 +518,13 @@ def process_file_job(
     log.debug(f"  knowledge_id: {knowledge_id}")
     log.debug(f"  collection_name: {collection_name}")
     log.debug(f"  content provided: {bool(content)}")
+    log.debug(f"  owner_email: {owner_email}")
+    log.debug(f"  embedding_model: {embedding_model}")
     log.debug(f"  embedding_api_key provided: {bool(embedding_api_key)}")
     log.debug("=" * 80)
     
-    log.info(f"[JOB] START | file_id={file_id} | user_id={user_id} | knowledge_id={knowledge_id}")
     start_time = time.time()
+    log.info(f"[JOB] START | file_id={file_id} | user_id={user_id} | knowledge_id={knowledge_id} | timestamp={start_time:.3f}")
     
     # Restore trace context from job metadata if available
     # This enables distributed tracing across process boundaries (main app → RQ worker)
@@ -490,20 +573,47 @@ def process_file_job(
                 try:
                     request = MockRequest(embedding_api_key=embedding_api_key)
                     
-                    # CRITICAL: Validate API key BEFORE initialization
-                    if not embedding_api_key or not embedding_api_key.strip():
+                    # RBAC: Validate owner_email, embedding_model, and API key BEFORE initialization
+                    if not owner_email or not owner_email.strip():
                         error_msg = (
-                            f"No embedding API key provided in job for file_id={file_id}! "
-                            f"This will cause embedding generation to fail. "
-                            f"The API key should have been retrieved from admin config and passed to the job."
+                            f"No owner_email provided in job for file_id={file_id}! "
+                            f"This is required for RBAC (per-admin model/key lookup)."
                         )
                         log.error(error_msg)
                         raise ValueError(error_msg)
                     
-                    # CRITICAL: Initialize EMBEDDING_FUNCTION per-job with the correct per-user/per-admin API key
-                    # This ensures RBAC-protected API keys are used (each admin has their own key)
+                    if not embedding_model or not embedding_model.strip():
+                        error_msg = (
+                            f"No embedding_model provided in job for file_id={file_id}! "
+                            f"This is required for RBAC (per-admin model). "
+                            f"Owner: {owner_email}"
+                        )
+                        log.error(error_msg)
+                        raise ValueError(error_msg)
+                    
+                    if not embedding_api_key or not embedding_api_key.strip():
+                        error_msg = (
+                            f"No embedding API key provided in job for file_id={file_id}! "
+                            f"This will cause embedding generation to fail. "
+                            f"The API key should have been retrieved from admin config and passed to the job. "
+                            f"Owner: {owner_email}"
+                        )
+                        log.error(error_msg)
+                        raise ValueError(error_msg)
+                    
+                    log.info(
+                        f"[JOB] RBAC Config: owner_email={owner_email}, "
+                        f"embedding_model={embedding_model}, "
+                        f"api_key_length={len(embedding_api_key) if embedding_api_key else 0}"
+                    )
+                    
+                    # CRITICAL: Initialize EMBEDDING_FUNCTION per-job with the correct per-user/per-admin API key and model
+                    # This ensures RBAC-protected API keys and models are used (each admin has their own key/model)
                     try:
-                        request.app.state.initialize_embedding_function(embedding_api_key=embedding_api_key)
+                        request.app.state.initialize_embedding_function(
+                            embedding_api_key=embedding_api_key,
+                            embedding_model=embedding_model  # Pass job parameter (RBAC-protected)
+                        )
                         
                         if request.app.state.EMBEDDING_FUNCTION is None:
                             error_msg = (
@@ -536,19 +646,27 @@ def process_file_job(
                                     "processing without user context"
                                 )
                             else:
-                                # CRITICAL: Set the user's API key in the config for save_docs_to_vector_db
-                                # This ensures RBAC-protected API keys are used (each admin has their own key)
-                                # Users inherit from their group admin's key
-                                if embedding_api_key and user.email:
+                                # RBAC: Set the owner's model and API key in the config for save_docs_to_vector_db
+                                # This ensures RBAC-protected model/key are used (each admin has their own)
+                                # Users inherit from their group admin's model/key
+                                if owner_email and embedding_model and embedding_api_key:
                                     try:
-                                        # Update the config with the user's API key to ensure consistency
-                                        # This is important because save_docs_to_vector_db retrieves the key from config
+                                        # Update the config with the owner's model and key to ensure consistency
+                                        # This is important because save_docs_to_vector_db retrieves from config
                                         if request.app.state.config.RAG_EMBEDDING_ENGINE in ["openai", "portkey"]:
-                                            # Set the user's API key in the config cache (RBAC-protected)
-                                            request.app.state.config.RAG_OPENAI_API_KEY.set(user.email, embedding_api_key)
+                                            # Set the owner's model and API key in the config (RBAC-protected)
+                                            request.app.state.config.RAG_EMBEDDING_MODEL_USER.set(owner_email, embedding_model)
+                                            request.app.state.config.RAG_OPENAI_API_KEY.set(owner_email, embedding_api_key)
+                                            log.info(
+                                                f"***** BACKGROUND JOB SETTING API KEY ***** "
+                                                f"The file processor background job is setting API key for owner '{owner_email}'. "
+                                                f"Model = '{embedding_model}', API Key = '{embedding_api_key}'. "
+                                                f"This happens during file embedding in the background queue."
+                                            )
                                     except Exception as config_update_error:
-                                        # Non-critical - the key is already passed and will be used as fallback
-                                        log.warning(f"Could not update config with user API key: {config_update_error}")
+                                        # Critical - model/key must be set for RBAC
+                                        log.error(f"Could not update config with owner model/key: {config_update_error}")
+                                        raise
                         except Exception as user_error:
                             log.warning(
                                 f"Error retrieving user {user_id} for file processing (file_id={file_id}): {user_error}, "
@@ -660,11 +778,16 @@ def process_file_job(
                                                 file_size = os.path.getsize(file_path)
                                                 log.info(f"[FILE] id={file.id} | name={file.filename} | size={file_size}B | path={file_path}")
                                                 extraction_engine_val = ""  # Force PyPDF for PDFs (OpenShift requirement)
-                                                pdf_extract_images_val = getattr(request.app.state.config, 'PDF_EXTRACT_IMAGES', False) if hasattr(request.app.state.config, 'PDF_EXTRACT_IMAGES') else False
-                                                log.info(f"[EXTRACT] START | file_id={file.id} | engine=PyPDF (forced) | extract_images={pdf_extract_images_val}")
+                                                # CRITICAL: Force extract_images=False to prevent hangs (image extraction causes 2+ minute slowdowns)
+                                                pdf_extract_images_val = False
+                                                log.info(f"[EXTRACT] START | file_id={file.id} | engine=PyPDF (forced) | extract_images={pdf_extract_images_val} (FORCED TO FALSE)")
                                                 loader = Loader(engine=extraction_engine_val, PDF_EXTRACT_IMAGES=pdf_extract_images_val)
                                                 try:
+                                                    print(f"[DEBUG] About to call loader.load() for file_id={file.id} | extract_images={pdf_extract_images_val}", flush=True)
+                                                    log.info(f"[DEBUG] About to call loader.load() for file_id={file.id} | extract_images={pdf_extract_images_val}")
                                                     docs = loader.load(file.filename, file.meta.get("content_type"), file_path)
+                                                    print(f"[DEBUG] loader.load() completed for file_id={file.id} | docs_count={len(docs) if docs else 0}", flush=True)
+                                                    log.info(f"[DEBUG] loader.load() completed for file_id={file.id} | docs_count={len(docs) if docs else 0}")
                                                     total_chars = sum(len(doc.page_content) for doc in docs) if docs else 0
                                                     non_empty = sum(1 for doc in docs if doc.page_content and doc.page_content.strip()) if docs else 0
                                                     log.info(f"[EXTRACT] SUCCESS | file_id={file.id} | docs={len(docs) if docs else 0} | chars={total_chars} | non_empty={non_empty}")
@@ -763,11 +886,16 @@ def process_file_job(
                                             file_size = os.path.getsize(file_path)
                                             log.info(f"[FILE] id={file.id} | name={file.filename} | size={file_size}B | path={file_path}")
                                             extraction_engine_val = ""  # Force PyPDF for PDFs (OpenShift requirement)
-                                            pdf_extract_images_val = getattr(request.app.state.config, 'PDF_EXTRACT_IMAGES', False) if hasattr(request.app.state.config, 'PDF_EXTRACT_IMAGES') else False
-                                            log.info(f"[EXTRACT] START | file_id={file.id} | engine=PyPDF (forced) | extract_images={pdf_extract_images_val}")
+                                            # CRITICAL: Force extract_images=False to prevent hangs (image extraction causes 2+ minute slowdowns)
+                                            pdf_extract_images_val = False
+                                            log.info(f"[EXTRACT] START | file_id={file.id} | engine=PyPDF (forced) | extract_images={pdf_extract_images_val} (FORCED TO FALSE)")
                                             loader = Loader(engine=extraction_engine_val, PDF_EXTRACT_IMAGES=pdf_extract_images_val)
                                             try:
+                                                print(f"[DEBUG] About to call loader.load() for file_id={file.id} | extract_images={pdf_extract_images_val}", flush=True)
+                                                log.info(f"[DEBUG] About to call loader.load() for file_id={file.id} | extract_images={pdf_extract_images_val}")
                                                 docs = loader.load(file.filename, file.meta.get("content_type"), file_path)
+                                                print(f"[DEBUG] loader.load() completed for file_id={file.id} | docs_count={len(docs) if docs else 0}", flush=True)
+                                                log.info(f"[DEBUG] loader.load() completed for file_id={file.id} | docs_count={len(docs) if docs else 0}")
                                                 total_chars = sum(len(doc.page_content) for doc in docs) if docs else 0
                                                 non_empty = sum(1 for doc in docs if doc.page_content and doc.page_content.strip()) if docs else 0
                                                 log.info(f"[EXTRACT] SUCCESS | file_id={file.id} | docs={len(docs) if docs else 0} | chars={total_chars} | non_empty={non_empty}")
@@ -845,14 +973,22 @@ def process_file_job(
                                         file_size = os.path.getsize(file_path)
                                         log.info(f"[FILE] id={file.id} | name={file.filename} | size={file_size}B | path={file_path}")
                                         extraction_engine_val = ""  # Force PyPDF for PDFs (OpenShift requirement)
-                                        pdf_extract_images_val = getattr(request.app.state.config, 'PDF_EXTRACT_IMAGES', False) if hasattr(request.app.state.config, 'PDF_EXTRACT_IMAGES') else False
-                                        log.info(f"[EXTRACT] START | file_id={file.id} | engine=PyPDF (forced) | extract_images={pdf_extract_images_val}")
+                                        # CRITICAL: Force extract_images=False to prevent hangs (image extraction causes 2+ minute slowdowns)
+                                        pdf_extract_images_val = False
+                                        extract_start = time.time()
+                                        log.info(f"[EXTRACT] START | file_id={file.id} | engine=PyPDF (forced) | extract_images={pdf_extract_images_val} (FORCED TO FALSE) | timestamp={extract_start:.3f}")
                                         loader = Loader(engine=extraction_engine_val, PDF_EXTRACT_IMAGES=pdf_extract_images_val)
                                         try:
+                                            print(f"[DEBUG] About to call loader.load() for file_id={file.id} | extract_images={pdf_extract_images_val} | timestamp={extract_start:.3f}", flush=True)
+                                            log.info(f"[DEBUG] About to call loader.load() for file_id={file.id} | extract_images={pdf_extract_images_val}")
                                             docs = loader.load(file.filename, file.meta.get("content_type"), file_path)
+                                            extract_end = time.time()
+                                            extract_duration = extract_end - extract_start
+                                            print(f"[DEBUG] loader.load() completed for file_id={file.id} | docs_count={len(docs) if docs else 0} | duration={extract_duration:.2f}s", flush=True)
+                                            log.info(f"[DEBUG] loader.load() completed for file_id={file.id} | docs_count={len(docs) if docs else 0} | duration={extract_duration:.2f}s")
                                             total_chars = sum(len(doc.page_content) for doc in docs) if docs else 0
                                             non_empty = sum(1 for doc in docs if doc.page_content and doc.page_content.strip()) if docs else 0
-                                            log.info(f"[EXTRACT] SUCCESS | file_id={file.id} | docs={len(docs) if docs else 0} | chars={total_chars} | non_empty={non_empty}")
+                                            log.info(f"[EXTRACT] SUCCESS | file_id={file.id} | docs={len(docs) if docs else 0} | chars={total_chars} | non_empty={non_empty} | duration={extract_duration:.2f}s | timestamp={extract_end:.3f}")
                                             log.debug(f"EXTRACT SUCCESS | docs={len(docs) if docs else 0} | chars={total_chars}")
                                             safe_add_span_event("job.file.extracted", {"content_length": total_chars, "document.count": len(docs)})
                                             docs = [Document(page_content=doc.page_content, metadata={**doc.metadata, "name": file.filename, "created_by": file.user_id, "file_id": file.id, "source": file.filename}) for doc in docs]
@@ -896,8 +1032,9 @@ def process_file_job(
                             text_content = file_content
                             log.debug(f"After USING_FILE_DATA | docs={len(docs)} | text_content_len={len(text_content)}")
 
-                    # Log state after if/else block
-                    log.debug("After REGULAR_UPLOAD if/else block:")
+                    # Log state after if/else block with timestamp
+                    current_time = time.time()
+                    log.debug(f"After REGULAR_UPLOAD if/else block | timestamp={current_time:.3f} | elapsed={current_time - start_time:.2f}s")
                     log.debug(f"  'docs' in locals: {'docs' in locals()}")
                     log.debug(f"  docs count: {len(docs) if 'docs' in locals() and docs else 'UNDEFINED or None'}")
                     log.debug(f"  'text_content' in locals: {'text_content' in locals()}")
@@ -911,9 +1048,10 @@ def process_file_job(
                         collection_name = vector_collection_name
                 except Exception as e:
                     # Consolidated error handling - log and update status
-                    elapsed_time = time.time() - start_time
+                    error_time = time.time()
+                    elapsed_time = error_time - start_time
                     error_msg = str(e)
-                    log.error(f"[JOB] FAILED | file_id={file_id} | user_id={user_id} | elapsed={elapsed_time:.2f}s | error={type(e).__name__}: {error_msg}", exc_info=True)
+                    log.error(f"[JOB] FAILED | file_id={file_id} | user_id={user_id} | elapsed={elapsed_time:.2f}s | timestamp={error_time:.3f} | error={type(e).__name__}: {error_msg}", exc_info=True)
                     
                     safe_add_span_event("job.failed", {
                         "error.type": type(e).__name__,
@@ -953,9 +1091,10 @@ def process_file_job(
                 except Exception as debug_error:
                     log.debug(f"  ERROR accessing docs: {debug_error}")
                 
+                validate_start = time.time()
                 total_chars = sum(len(doc.page_content) for doc in docs) if docs else 0
                 non_empty = sum(1 for doc in docs if doc.page_content and doc.page_content.strip()) if docs else 0
-                log.info(f"[VALIDATE] START | file_id={file.id} | docs={len(docs) if docs else 0} | chars={total_chars} | non_empty={non_empty}")
+                log.info(f"[VALIDATE] START | file_id={file.id} | docs={len(docs) if docs else 0} | chars={total_chars} | non_empty={non_empty} | timestamp={validate_start:.3f} | elapsed={validate_start - start_time:.2f}s")
                 log.debug(f"VALIDATION | docs={len(docs) if docs else 0} | chars={total_chars} | non_empty={non_empty}")
                 
                 if not docs or len(docs) == 0:
@@ -971,7 +1110,9 @@ def process_file_job(
                     Files.update_file_metadata_by_id(file.id, {"processing_status": "error", "processing_error": error_msg})
                     raise ValueError(error_msg)
                 
-                log.info(f"[VALIDATE] PASSED | file_id={file.id} | docs={len(docs)} | chars={total_chars} | non_empty={non_empty}")
+                validate_end = time.time()
+                validate_duration = validate_end - validate_start
+                log.info(f"[VALIDATE] PASSED | file_id={file.id} | docs={len(docs)} | chars={total_chars} | non_empty={non_empty} | duration={validate_duration:.2f}s | timestamp={validate_end:.3f} | elapsed={validate_end - start_time:.2f}s")
 
                 Files.update_file_data_by_id(
                     file.id,
@@ -985,12 +1126,17 @@ def process_file_job(
                 bypass_embedding = getattr(request.app.state.config, 'BYPASS_EMBEDDING_AND_RETRIEVAL', False) if hasattr(request.app.state.config, 'BYPASS_EMBEDDING_AND_RETRIEVAL') else False
                 
                 if not bypass_embedding:
+                    embed_start = time.time()
+                    filename = getattr(file, "filename", "") or ""
+                    log.info(f"[RAG File] file_id={file.id} | filename={filename} | docs_pre_split={len(docs)} (chunking and embedding next)")
+                    log.info(f"[EMBED] START | file_id={file.id} | filename={filename} | docs_pre_split={len(docs)} | timestamp={embed_start:.3f}")
                     try:
                         # If knowledge_id is provided, we're adding to both collections at once
                         if knowledge_id:
                             file_collection = f"file-{file.id}"
                             collections = [file_collection, knowledge_id]
 
+                            # RBAC: Pass owner_email so save_docs_to_multiple_collections uses per-admin model/key
                             result = save_docs_to_multiple_collections(
                                 request,
                                 docs=docs,
@@ -1001,11 +1147,14 @@ def process_file_job(
                                     "hash": hash,
                                 },
                                 user=user,  # Use user object if available
+                                owner_email=owner_email,  # RBAC: Per-admin model/key lookup
                             )
 
                             # Use file collection name for file metadata
                             if result:
-                                log.info(f"[EMBED] SUCCESS | file_id={file.id} | collections={collections}")
+                                embed_end = time.time()
+                                embed_duration = embed_end - embed_start
+                                log.info(f"[EMBED] SUCCESS | file_id={file.id} | filename={filename} | collections={collections} | docs_pre_split={len(docs)} | duration={embed_duration:.2f}s | timestamp={embed_end:.3f}")
                                 safe_add_span_event("job.embedding.completed", {"status": "success", "collection_name": file_collection})
                                 Files.update_file_metadata_by_id(
                                     file.id,
@@ -1016,7 +1165,7 @@ def process_file_job(
                                     },
                                 )
                             else:
-                                log.error(f"[EMBED] FAILED | file_id={file.id} | reason=SAVE_TO_VDB_FAILED")
+                                log.error(f"[EMBED] FAILED | file_id={file.id} | filename={filename} | reason=SAVE_TO_VDB_FAILED")
                                 Files.update_file_metadata_by_id(
                                     file.id,
                                     {
@@ -1026,7 +1175,8 @@ def process_file_job(
                                 )
                         else:
                             file_collection = f"file-{file.id}"
-                            log.info(f"[EMBED] SINGLE_COLLECTION | file_id={file.id} | collection={file_collection}")
+                            log.info(f"[EMBED] SINGLE_COLLECTION | file_id={file.id} | filename={filename} | collection={file_collection} | docs_pre_split={len(docs)} | timestamp={time.time():.3f}")
+                            # RBAC: Pass owner_email so save_docs_to_vector_db uses per-admin model/key
                             result = save_docs_to_vector_db(
                                 request,
                                 docs=docs,
@@ -1038,9 +1188,13 @@ def process_file_job(
                                 },
                                 add=(True if collection_name else False),
                                 user=user,  # Use user object if available
+                                owner_email=owner_email,  # RBAC: Per-admin model/key lookup
                             )
 
                             if result:
+                                embed_end = time.time()
+                                embed_duration = embed_end - embed_start
+                                log.info(f"[EMBED] SUCCESS | file_id={file.id} | filename={filename} | collection={collection_name} | docs_pre_split={len(docs)} | duration={embed_duration:.2f}s | timestamp={embed_end:.3f}")
                                 Files.update_file_metadata_by_id(
                                     file.id,
                                     {
@@ -1050,7 +1204,7 @@ def process_file_job(
                                     },
                                 )
                             else:
-                                log.error(f"[EMBED] FAILED | file_id={file.id} | reason=SAVE_TO_VDB_FAILED")
+                                log.error(f"[EMBED] FAILED | file_id={file.id} | filename={filename} | reason=SAVE_TO_VDB_FAILED")
                                 Files.update_file_metadata_by_id(
                                     file.id,
                                     {
@@ -1060,7 +1214,7 @@ def process_file_job(
                                 )
                     except Exception as e:
                         error_msg = str(e)
-                        log.error(f"[EMBED] FAILED | file_id={file.id} | error={type(e).__name__}: {error_msg}", exc_info=True)
+                        log.error(f"[EMBED] FAILED | file_id={file.id} | filename={filename} | error={type(e).__name__}: {error_msg}", exc_info=True)
                         try:
                             Files.update_file_metadata_by_id(
                                 file.id,

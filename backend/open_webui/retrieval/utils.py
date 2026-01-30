@@ -18,7 +18,8 @@ try:
     PORTKEY_SDK_AVAILABLE = True
 except ImportError:
     PORTKEY_SDK_AVAILABLE = False
-    log.warning("Portkey SDK not available. Install portkey-ai package for embedding support.")
+
+log = logging.getLogger(__name__)
 
 
 from open_webui.config import VECTOR_DB, RAG_EMBEDDING_MODEL
@@ -34,9 +35,7 @@ from open_webui.env import (
     ENABLE_FORWARD_USER_INFO_HEADERS,
 )
 
-log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["RAG"])
-
 
 from typing import Any
 
@@ -79,6 +78,7 @@ class VectorSearchRetriever(BaseRetriever):
 def query_doc(
     collection_name: str, query_embedding: list[float], k: int, user: UserModel = None
 ):
+    log.info(f"[VECTOR_SEARCH] query_doc START | collection={collection_name} | k={k} | embedding_len={len(query_embedding) if query_embedding else 0}")
     try:
         result = VECTOR_DB_CLIENT.search(
             collection_name=collection_name,
@@ -87,24 +87,31 @@ def query_doc(
         )
 
         if result:
-            log.info(f"query_doc:result {result.ids} {result.metadatas}")
+            num_results = len(result.ids[0]) if result.ids and result.ids[0] else 0
+            log.info(f"[VECTOR_SEARCH] query_doc SUCCESS | collection={collection_name} | results_count={num_results} | ids={result.ids} | metadatas={result.metadatas}")
+        else:
+            log.info(f"[VECTOR_SEARCH] query_doc EMPTY | collection={collection_name} | no results")
 
         return result
     except Exception as e:
-        log.exception(f"Error querying doc {collection_name} with limit {k}: {e}")
+        log.exception(f"[VECTOR_SEARCH] query_doc ERROR | collection={collection_name} | k={k} | error={e}")
         raise e
 
 
 def get_doc(collection_name: str, user: UserModel = None):
+    log.info(f"[VECTOR_GET] get_doc START | collection={collection_name}")
     try:
         result = VECTOR_DB_CLIENT.get(collection_name=collection_name)
 
         if result:
-            log.info(f"query_doc:result {result.ids} {result.metadatas}")
+            num_docs = len(result.ids[0]) if result.ids and result.ids[0] else 0
+            log.info(f"[VECTOR_GET] get_doc SUCCESS | collection={collection_name} | docs_count={num_docs} | ids={result.ids} | metadatas={result.metadatas}")
+        else:
+            log.info(f"[VECTOR_GET] get_doc EMPTY | collection={collection_name} | no documents")
 
         return result
     except Exception as e:
-        log.exception(f"Error getting doc {collection_name}: {e}")
+        log.exception(f"[VECTOR_GET] get_doc ERROR | collection={collection_name} | error={e}")
         raise e
 
 
@@ -243,11 +250,12 @@ def query_collection(
     embedding_function,
     k: int,
 ) -> dict:
+    log.info(f"[QUERY_COLLECTION] START | collections={list(collection_names)} | queries_count={len(queries) if queries else 0} | k={k} | queries={queries[:3] if queries else []}{'...' if queries and len(queries) > 3 else ''}")
     results = []
     
     # Handle edge cases
     if not queries or len(queries) == 0:
-        log.warning("query_collection called with empty queries list")
+        log.warning("[QUERY_COLLECTION] EMPTY | called with empty queries list")
         return merge_and_sort_query_results(results, k=k, reverse=True) if VECTOR_DB != "chroma" else merge_and_sort_query_results(results, k=k, reverse=False)
     
     if not collection_names or len(collection_names) == 0:
@@ -404,9 +412,13 @@ def query_collection(
     if VECTOR_DB == "chroma":
         # Chroma uses unconventional cosine similarity, so we don't need to reverse the results
         # https://docs.trychroma.com/docs/collections/configure#configuring-chroma-collections
-        return merge_and_sort_query_results(results, k=k, reverse=False)
+        merged = merge_and_sort_query_results(results, k=k, reverse=False)
     else:
-        return merge_and_sort_query_results(results, k=k, reverse=True)
+        merged = merge_and_sort_query_results(results, k=k, reverse=True)
+    
+    merged_count = len(merged.get("documents", [[]])[0]) if merged and merged.get("documents") else 0
+    log.info(f"[QUERY_COLLECTION] DONE | collections={list(collection_names)} | results_merged={merged_count} | k={k}")
+    return merged
 
 
 def query_collection_with_hybrid_search(
@@ -417,6 +429,7 @@ def query_collection_with_hybrid_search(
     reranking_function,
     r: float,
 ) -> dict:
+    log.info(f"[HYBRID_SEARCH] START | collections={list(collection_names)} | queries_count={len(queries) if queries else 0} | k={k} | r={r}")
     results = []
     errors = []
     
@@ -498,6 +511,7 @@ def query_collection_with_hybrid_search(
 
     # Only raise error if ALL searches failed
     if len(errors) == len(query_collection_pairs):
+        log.error(f"[HYBRID_SEARCH] ALL_FAILED | collections={list(collection_names)} | errors_count={len(errors)}")
         raise Exception(
             "Hybrid search failed for all collections. Using Non hybrid search as fallback."
         )
@@ -505,9 +519,13 @@ def query_collection_with_hybrid_search(
     if VECTOR_DB == "chroma":
         # Chroma uses unconventional cosine similarity, so we don't need to reverse the results
         # https://docs.trychroma.com/docs/collections/configure#configuring-chroma-collections
-        return merge_and_sort_query_results(results, k=k, reverse=False)
+        merged = merge_and_sort_query_results(results, k=k, reverse=False)
     else:
-        return merge_and_sort_query_results(results, k=k, reverse=True)
+        merged = merge_and_sort_query_results(results, k=k, reverse=True)
+    
+    merged_count = len(merged.get("documents", [[]])[0]) if merged and merged.get("documents") else 0
+    log.info(f"[HYBRID_SEARCH] DONE | collections={list(collection_names)} | results_merged={merged_count} | errors_count={len(errors)} | k={k}")
+    return merged
 
 
 def get_embedding_function(
@@ -599,6 +617,7 @@ def get_sources_from_files(
     relevant_contexts = []
 
     for file in files:
+        queried_collections_this_file = []
 
         context = None
         if file.get("docs"):
@@ -675,9 +694,11 @@ def get_sources_from_files(
             if not collection_names:
                 log.debug(f"skipping {file} as it has already been extracted")
                 continue
-            
+
+            queried_collections_this_file = list(collection_names)
+
             # Log collection names being queried for debugging RAG issues
-            log.info(f"[RAG Query] file_id={file.get('id')} | collection_names={list(collection_names)} | queries_count={len(queries)}")
+            log.info(f"[RAG Query] file_id={file.get('id')} | collection_names={queried_collections_this_file} | queries_count={len(queries)}")
             
             # Check if collections actually exist and have documents
             for coll_name in collection_names:
@@ -746,6 +767,24 @@ def get_sources_from_files(
             if "data" in file:
                 del file["data"]
 
+            # RAG debug: per-file retrieval result (which file, how many chunks retrieved)
+            num_chunks = 0
+            if context.get("documents") and context["documents"]:
+                num_chunks = len(context["documents"][0])
+            file_id = file.get("id", "")
+            file_name = file.get("name") or file.get("filename")
+            if not file_name:
+                _file = file.get("file")
+                if isinstance(_file, dict):
+                    _data = _file.get("data")
+                    if isinstance(_data, dict):
+                        file_name = _data.get("name")
+            if not file_name:
+                file_name = f"collection:{file_id}" if file.get("type") == "collection" else str(file_id)
+            file_name = str(file_name) if file_name else str(file_id)
+            log.info(
+                f"[RAG Retrieval] file_id={file_id} | file_name={file_name} | chunks_retrieved={num_chunks} | collections_queried={queried_collections_this_file}"
+            )
             relevant_contexts.append({**context, "file": file})
 
     sources = []
@@ -895,23 +934,6 @@ def generate_portkey_embeddings_sdk(
             "Portkey API key is empty! This will result in 401 Unauthorized. "
             "Ensure the admin has configured an embedding API key in Settings > Documents."
         )
-        raise ValueError(
-            "Portkey API key is required. Please configure it in Settings > Documents > Embedding."
-        )
-    
-    # CRITICAL: Validate base_url is not empty
-    # When base_url is empty, Portkey SDK defaults to https://api.portkey.ai/v1
-    # But the API key is typically configured for a custom gateway URL
-    # This mismatch causes 403 Forbidden errors
-    if not base_url or base_url.strip() == "":
-        error_msg = (
-            "Portkey base_url is empty! This causes the SDK to default to "
-            "https://api.portkey.ai/v1, which may not match your API key's gateway URL. "
-            "Please configure RAG_OPENAI_API_BASE_URL in Settings > Documents > Embedding, "
-            "or set the RAG_OPENAI_API_BASE_URL environment variable."
-        )
-        log.error(error_msg)
-        raise ValueError(error_msg)
     
     # Initialize Portkey client (simple - no deprecated virtual_key)
     portkey = Portkey(
@@ -921,51 +943,179 @@ def generate_portkey_embeddings_sdk(
     
     # Generate embeddings using SDK
     # The SDK handles retries, rate limiting, and error handling automatically
+    # CRITICAL: Azure OpenAI (via Portkey) has a limit of 2048 items per request
+    # We need to batch large requests into chunks of max 2048 items
+    MAX_BATCH_SIZE = 2048
+    
     try:
+        # Convert single string to list for uniform processing
+        is_single_string = isinstance(texts, str)
+        if is_single_string:
+            texts_list = [texts]
+        elif isinstance(texts, list):
+            texts_list = texts
+        else:
+            raise ValueError(f"Invalid input type: {type(texts)}. Expected str or list[str]")
+        
+        texts_count = len(texts_list)
+        
+        # CRITICAL: Validate input format and log detailed diagnostics
+        log.info(
+            f"Portkey embedding input validation: "
+            f"input_type={type(texts)}, "
+            f"texts_count={texts_count}, "
+            f"is_list={isinstance(texts_list, list)}"
+        )
+        
+        # Sample first few items to diagnose format issues
+        sample_items = []
+        non_string_count = 0
+        empty_count = 0
+        very_short_count = 0  # Items with length <= 1
+        
+        for i, text in enumerate(texts_list[:10]):  # Check first 10 items
+            if not isinstance(text, str):
+                non_string_count += 1
+                sample_items.append(f"idx{i}:{type(text).__name__}={text!r}")
+            elif len(text.strip()) == 0:
+                empty_count += 1
+                sample_items.append(f"idx{i}:EMPTY")
+            elif len(text) <= 1:
+                very_short_count += 1
+                sample_items.append(f"idx{i}:LEN{len(text)}={text!r}")
+            else:
+                preview = text[:50].replace("\n", " ") + ("..." if len(text) > 50 else "")
+                sample_items.append(f"idx{i}:LEN{len(text)}={preview!r}")
+        
+        # Check beyond first 10 for patterns
+        for i in range(10, min(100, texts_count)):
+            text = texts_list[i]
+            if not isinstance(text, str):
+                non_string_count += 1
+            elif len(text.strip()) == 0:
+                empty_count += 1
+            elif len(text) <= 1:
+                very_short_count += 1
+        
+        log.warning(
+            f"Portkey input diagnostics: "
+            f"non_string_items={non_string_count}, "
+            f"empty_items={empty_count}, "
+            f"very_short_items(<=1char)={very_short_count}, "
+            f"sample_items={sample_items[:5]}"
+        )
+        
+        # Validate all items are strings
+        for i, text in enumerate(texts_list):
+            if not isinstance(text, str):
+                raise ValueError(
+                    f"Item at index {i} is not a string: {type(text)}={text!r}. "
+                    f"This suggests incorrect chunking or document processing."
+                )
+            if not text.strip():
+                log.warning(f"Empty string at index {i} - may cause API errors")
+        
+        # Warn if most items are very short (suggests character-level chunking bug)
+        if texts_count > 100 and very_short_count > texts_count * 0.9:
+            error_msg = (
+                f"CRITICAL: {very_short_count}/{texts_count} items are <=1 character. "
+                f"This suggests chunk_size=0 or character-level splitting bug. "
+                f"Check chunk_size configuration (should be >0, typically 500-2000)."
+            )
+            log.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # Log a concise view of the request payload
+        if texts_list:
+            first_str = texts_list[0][:80].replace("\n", " ") + ("..." if len(texts_list[0]) > 80 else "")
+            avg_len = sum(len(t) for t in texts_list[:100]) / min(100, texts_count)
+        else:
+            first_str = "<empty>"
+            avg_len = 0
+        
         log.info(
             f"Generating Portkey embeddings via SDK: "
             f"model={model}, "
-            f"texts_count={len(texts) if isinstance(texts, list) else 1}, "
-            f"encoding_format={encoding_format}"
+            f"texts_count={texts_count}, "
+            f"avg_text_length={avg_len:.1f}, "
+            f"encoding_format={encoding_format}, "
+            f"sample_preview={first_str!r}, "
+            f"will_batch={texts_count > MAX_BATCH_SIZE}"
         )
         
-        response = portkey.embeddings.create(
-            model=model,
-            input=texts,
-            encoding_format=encoding_format
-        )
-        
-        # Extract embeddings from response
-        # Response.data is a list of EmbeddingData objects, ordered by index
-        embeddings = [item.embedding for item in response.data]
+        # Batch processing for large requests
+        if texts_count <= MAX_BATCH_SIZE:
+            # Single batch - process all at once
+            # Log complete request payload details
+            sample_texts = [t[:50].replace("\n", " ") + ("..." if len(t) > 50 else "") for t in texts_list[:5]]
+            log.info(
+                f"[Portkey Request Payload]\n"
+                f"  Settings:\n"
+                f"    model: {model}\n"
+                f"    base_url: {base_url}\n"
+                f"    api_key: {api_key[:10]}...{api_key[-4:] if len(api_key) > 14 else '***'} (len={len(api_key)})\n"
+                f"    encoding_format: {encoding_format}\n"
+                f"  Payload:\n"
+                f"    input_type: {type(texts_list).__name__}\n"
+                f"    input_length: {texts_count}\n"
+                f"    input_shape: [{texts_count}]\n"
+                f"    avg_text_len: {sum(len(t) for t in texts_list) / texts_count:.1f}\n"
+                f"    min_text_len: {min(len(t) for t in texts_list)}\n"
+                f"    max_text_len: {max(len(t) for t in texts_list)}\n"
+                f"    sample_texts (first 5): {sample_texts}"
+            )
+            response = portkey.embeddings.create(
+                model=model,
+                input=texts_list,
+                encoding_format=encoding_format
+            )
+            
+            # Extract embeddings from response
+            embeddings = [item.embedding for item in response.data]
+        else:
+            # Multiple batches needed - process in chunks
+            log.info(f"Batching {texts_count} texts into chunks of {MAX_BATCH_SIZE} for Azure OpenAI limit")
+            all_embeddings = []
+            
+            for i in range(0, texts_count, MAX_BATCH_SIZE):
+                batch = texts_list[i:i + MAX_BATCH_SIZE]
+                batch_num = (i // MAX_BATCH_SIZE) + 1
+                total_batches = (texts_count + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE
+                sample_batch = [t[:50].replace("\n", " ") + ("..." if len(t) > 50 else "") for t in batch[:3]]
+                log.info(
+                    f"[Portkey Batch {batch_num}/{total_batches}]\n"
+                    f"  Settings: model={model}, base_url={base_url}, api_key={api_key[:10]}...{api_key[-4:] if len(api_key) > 14 else '***'}, encoding={encoding_format}\n"
+                    f"  Payload: input_length={len(batch)}, shape=[{len(batch)}], avg_len={sum(len(t) for t in batch) / len(batch):.1f}\n"
+                    f"  Sample (first 3): {sample_batch}"
+                )
+                response = portkey.embeddings.create(
+                    model=model,
+                    input=batch,
+                    encoding_format=encoding_format
+                )
+                
+                batch_embeddings = [item.embedding for item in response.data]
+                all_embeddings.extend(batch_embeddings)
+            
+            embeddings = all_embeddings
         
         # Validate embeddings were generated
         if not embeddings:
             raise ValueError("No embeddings returned from Portkey SDK")
         
+        if len(embeddings) != texts_count:
+            raise ValueError(
+                f"Embedding count mismatch: expected {texts_count}, got {len(embeddings)}"
+            )
+        
         # Return single embedding for single string, list for batch
-        if isinstance(texts, str):
+        if is_single_string:
             if len(embeddings) == 0:
                 raise ValueError("Expected at least one embedding for single text input")
             return embeddings[0]
         return embeddings
         
     except Exception as e:
-        error_msg = str(e)
-        # Provide more helpful error messages for common issues
-        if "403" in error_msg or "Forbidden" in error_msg:
-            log.error(
-                f"Portkey API returned 403 Forbidden. This usually means:\n"
-                f"1. The API key is not valid for the gateway URL ({base_url})\n"
-                f"2. The base_url ({base_url}) doesn't match the API key's configured gateway\n"
-                f"3. The API key doesn't have permission to use embeddings\n"
-                f"Please verify your API key and base_url in Settings > Documents > Embedding."
-            )
-        elif "401" in error_msg or "Unauthorized" in error_msg:
-            log.error(
-                f"Portkey API returned 401 Unauthorized. The API key may be invalid or expired. "
-                f"Please check your API key in Settings > Documents > Embedding."
-            )
         log.exception(f"Error generating Portkey embeddings via SDK: {e}")
         raise
 
@@ -1030,29 +1180,22 @@ def generate_embeddings(
     url = kwargs.get("url", "")
     key = kwargs.get("key", "")
     user = kwargs.get("user")
+    user_email = user.email if user and hasattr(user, 'email') else "(no user)"
+    text_count = len(text) if isinstance(text, list) else 1
+    log.info(f"[GENERATE_EMBEDDINGS] START | engine={engine} | model={model} | texts_count={text_count} | url={url} | key={key} | user={user_email}")
     
     # CRITICAL FIX: For portkey/openai engines, dynamically retrieve the user's API key
     # The `key` passed in may be the startup default (empty), but users configure their own keys
     # This ensures per-user API key scoping works correctly for RAG queries
-    # RBAC: The key is retrieved based on user.email, which ensures:
-    # 1. User's own key (if set)
-    # 2. Group admin's key (if user is in a group created by an admin)
-    # 3. NOT accessible to other admins' keys (only their own group's admin)
     if engine in ["openai", "portkey"] and user and hasattr(user, 'email') and user.email:
         try:
             from open_webui.config import RAG_OPENAI_API_KEY
             user_key = RAG_OPENAI_API_KEY.get(user.email)
             if user_key:
-                log.info(
-                    f"Using RBAC-scoped embedding API key for {user.email} "
-                    f"(key length: {len(user_key)}, accessible only to this user and their group admin's groups)"
-                )
+                log.debug(f"Using per-user API key for {user.email} (key length: {len(user_key)})")
                 key = user_key
             else:
-                log.warning(
-                    f"No embedding API key found for user {user.email} - "
-                    f"check if user is in a group with an admin who has configured an API key"
-                )
+                log.warning(f"No embedding API key found for user {user.email} - using default (may be empty)")
         except Exception as e:
             log.warning(f"Failed to retrieve per-user API key: {e}")
 
@@ -1071,6 +1214,8 @@ def generate_embeddings(
                     "user": user,
                 }
             )
+        emb_count = len(embeddings) if isinstance(embeddings, list) else 1
+        log.info(f"[GENERATE_EMBEDDINGS] SUCCESS | engine=ollama | model={model} | embeddings_count={emb_count} | user={user_email}")
         return embeddings[0] if isinstance(text, str) else embeddings
     elif engine == "openai":
         if isinstance(text, list):
@@ -1078,6 +1223,8 @@ def generate_embeddings(
         else:
             embeddings = generate_openai_batch_embeddings(model, [text], url, key, user)
 
+        emb_count = len(embeddings) if isinstance(embeddings, list) else 1
+        log.info(f"[GENERATE_EMBEDDINGS] SUCCESS | engine=openai | model={model} | embeddings_count={emb_count} | user={user_email}")
         return embeddings[0] if isinstance(text, str) else embeddings
     elif engine == "portkey":
         # Use SDK-based implementation
@@ -1088,8 +1235,11 @@ def generate_embeddings(
             api_key=key,
             encoding_format="float"
         )
+        emb_count = len(embeddings) if isinstance(embeddings, list) else 1
+        log.info(f"[GENERATE_EMBEDDINGS] SUCCESS | engine={engine} | model={model} | embeddings_count={emb_count} | user={user_email}")
         return embeddings
     else:
+        log.error(f"[GENERATE_EMBEDDINGS] ERROR | unknown engine={engine}")
         raise ValueError(f"Unknown embedding engine: {engine}")
 
 

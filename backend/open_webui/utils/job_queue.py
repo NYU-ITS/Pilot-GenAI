@@ -120,24 +120,35 @@ def get_job_queue(queue_name: str = FILE_PROCESSING_QUEUE_NAME) -> Optional[Queu
             log.warning("REDIS_URL not configured, job queue unavailable")
             return None
         
+        import time
         # Check cache first (thread-safe)
+        cache_check_start = time.time()
         with _queue_cache_lock:
             if queue_name in _queue_cache:
                 cached_queue = _queue_cache[queue_name]
                 # Verify connection still works
+                ping_start = time.time()
                 try:
                     cached_queue.connection.ping()
+                    ping_end = time.time()
+                    cache_check_end = time.time()
+                    log.debug(f"[JOB_QUEUE] Using cached queue | queue={queue_name} | ping_duration={ping_end - ping_start:.3f}s | total_duration={cache_check_end - cache_check_start:.3f}s | timestamp={cache_check_end:.3f}")
                     return cached_queue
                 except Exception:
+                    ping_end = time.time()
                     # Connection dead, remove from cache and create new one
-                    log.warning(f"Cached queue {queue_name} has dead connection, recreating")
+                    log.warning(f"[JOB_QUEUE] Cached queue {queue_name} has dead connection, recreating | ping_duration={ping_end - ping_start:.3f}s")
                     del _queue_cache[queue_name]
         
         # Get Redis connection pool (shared across application)
         # Always use master for job queue (requires writes)
+        pool_get_start = time.time()
         pool = get_redis_pool(REDIS_URL, use_master=True)
+        pool_get_end = time.time()
+        log.debug(f"[JOB_QUEUE] Redis pool retrieved | duration={pool_get_end - pool_get_start:.3f}s | timestamp={pool_get_end:.3f}")
         
         # Handle Sentinel connection wrapper
+        conn_get_start = time.time()
         if hasattr(pool, '_conn'):
             redis_conn = pool._conn
         elif hasattr(pool, 'get_connection'):
@@ -150,16 +161,27 @@ def get_job_queue(queue_name: str = FILE_PROCESSING_QUEUE_NAME) -> Optional[Queu
         else:
             # Standard connection pool
             redis_conn = Redis(connection_pool=pool)
+        conn_get_end = time.time()
+        log.debug(f"[JOB_QUEUE] Redis connection obtained | duration={conn_get_end - conn_get_start:.3f}s | timestamp={conn_get_end:.3f}")
         
         # Test connection
+        ping_start = time.time()
         redis_conn.ping()
+        ping_end = time.time()
+        log.debug(f"[JOB_QUEUE] Connection ping test | duration={ping_end - ping_start:.3f}s | timestamp={ping_end:.3f}")
         
         # Create queue with the connection
+        queue_create_start = time.time()
         queue = Queue(queue_name, connection=redis_conn)
+        queue_create_end = time.time()
+        log.debug(f"[JOB_QUEUE] Queue object created | queue={queue_name} | duration={queue_create_end - queue_create_start:.3f}s | timestamp={queue_create_end:.3f}")
         
         # Cache the queue instance for reuse
+        cache_store_start = time.time()
         with _queue_cache_lock:
             _queue_cache[queue_name] = queue
+        cache_store_end = time.time()
+        log.debug(f"[JOB_QUEUE] Queue cached | queue={queue_name} | duration={cache_store_end - cache_store_start:.3f}s | timestamp={cache_store_end:.3f}")
         
         log.debug(f"Created and cached job queue: {queue_name}")
         return queue
@@ -177,6 +199,8 @@ def enqueue_file_processing_job(
     collection_name: Optional[str] = None,
     knowledge_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    owner_email: Optional[str] = None,
+    embedding_model: Optional[str] = None,
     embedding_api_key: Optional[str] = None,
     job_timeout: int = DEFAULT_JOB_TIMEOUT,
 ) -> Optional[str]:
@@ -189,6 +213,8 @@ def enqueue_file_processing_job(
         collection_name: Optional collection name for embeddings (must be JSON-serializable)
         knowledge_id: Optional knowledge base ID (must be JSON-serializable)
         user_id: User ID who initiated the processing (must be JSON-serializable)
+        owner_email: Email of the admin who owns the KB/file (for RBAC - per-admin model/key lookup)
+        embedding_model: Per-admin embedding model name (resolved at enqueue time for RBAC)
         embedding_api_key: API key for embedding service (per-user, from admin config)
         job_timeout: Job timeout in seconds (default: 1 hour)
         
@@ -211,32 +237,44 @@ def enqueue_file_processing_job(
             "collection_name": collection_name,
             "knowledge_id": knowledge_id,
             "user_id": user_id,
+            "owner_email": owner_email,
+            "embedding_model": embedding_model,
             "embedding_api_key": embedding_api_key,
         })
     except (TypeError, ValueError) as e:
         log.error(f"Job arguments are not JSON-serializable for file_id={file_id}: {e}")
         return None
     
+    import time
+    enqueue_start = time.time()
+    log.info(f"[JOB_QUEUE] Starting enqueue operation | file_id={file_id} | timestamp={enqueue_start:.3f}")
     try:
+        queue_get_start = time.time()
         queue = get_job_queue()
+        queue_get_end = time.time()
+        log.info(f"[JOB_QUEUE] Queue retrieved | duration={queue_get_end - queue_get_start:.3f}s | timestamp={queue_get_end:.3f}")
         if queue is None:
-            log.warning(f"Job queue unavailable, cannot enqueue file processing for file_id={file_id}")
+            log.warning(f"[JOB_QUEUE] Job queue unavailable, cannot enqueue file processing for file_id={file_id}")
             return None
         
         # Generate unique job ID per file
         job_id_str = f"file_processing_{file_id}"
         
         # Check if a job with this ID already exists
+        job_fetch_start = time.time()
         try:
             existing_job = Job.fetch(job_id_str, connection=queue.connection)
+            job_fetch_end = time.time()
+            log.info(f"[JOB_QUEUE] Job fetch check | duration={job_fetch_end - job_fetch_start:.3f}s | timestamp={job_fetch_end:.3f}")
             if existing_job:
                 existing_status = existing_job.get_status()
                 
                 # If job is queued or started, file is already being processed
                 if existing_status in [JobStatus.QUEUED, JobStatus.STARTED]:
+                    enqueue_end = time.time()
                     log.info(
-                        f"Job {job_id_str} already exists with status {existing_status} "
-                        f"for file_id={file_id}, returning existing job ID"
+                        f"[JOB_QUEUE] Job {job_id_str} already exists with status {existing_status} "
+                        f"for file_id={file_id}, returning existing job ID | total_duration={enqueue_end - enqueue_start:.3f}s | timestamp={enqueue_end:.3f}"
                     )
                     return existing_job.id
                 
@@ -269,12 +307,15 @@ def enqueue_file_processing_job(
                 trace_context = {}
         
         # Prepare job arguments (serializable data only)
+        # RBAC: Include owner_email and embedding_model for per-admin model/key resolution in worker
         job_kwargs = {
             "file_id": file_id,
             "content": content,
             "collection_name": collection_name,
             "knowledge_id": knowledge_id,
             "user_id": user_id,
+            "owner_email": owner_email,  # KB owner or uploader (for RBAC)
+            "embedding_model": embedding_model,  # Per-admin model name (resolved at enqueue time)
             "embedding_api_key": embedding_api_key,
         }
         
@@ -300,6 +341,7 @@ def enqueue_file_processing_job(
         
             # Try to enqueue the job
             # RQ may raise an exception if job_id already exists (race condition)
+            enqueue_redis_start = time.time()
             try:
                 job = queue.enqueue(
                     process_file_job,
@@ -310,10 +352,13 @@ def enqueue_file_processing_job(
                     result_ttl=JOB_RESULT_TTL,  # Configurable TTL for job results
                     failure_ttl=JOB_FAILURE_TTL,  # Configurable TTL for failed job info
                 )
+                enqueue_redis_end = time.time()
+                enqueue_end = time.time()
                 safe_add_span_event("job.enqueued", {"job_id": job.id, "file_id": file_id})
                 log.info(
-                    f"Enqueued file processing job: job_id={job.id}, file_id={file_id}, "
-                    f"queue={FILE_PROCESSING_QUEUE_NAME}"
+                    f"[JOB_QUEUE] Enqueued file processing job | job_id={job.id} | file_id={file_id} | "
+                    f"queue={FILE_PROCESSING_QUEUE_NAME} | redis_duration={enqueue_redis_end - enqueue_redis_start:.3f}s | "
+                    f"total_duration={enqueue_end - enqueue_start:.3f}s | timestamp={enqueue_end:.3f}"
                 )
                 return job.id
             except Exception as enqueue_error:
